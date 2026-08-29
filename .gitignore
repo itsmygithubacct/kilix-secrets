@@ -1,0 +1,12 @@
+/build/
+/build-*/
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+core
