@@ -9,7 +9,8 @@ enum {
     KSEC_SLOT_BYTES = 124,
     KSEC_HEADER_BASE_BYTES = KSEC_HEADER_PREFIX_BYTES + 2 * KSEC_SLOT_BYTES,
     KSEC_HEADER_BYTES = KSEC_HEADER_BASE_BYTES + KSEC_NONCE_BYTES + KSEC_HEADER_TAG_BYTES,
-    KSEC_RECORD_PLAIN_FIXED_BYTES = 26
+    KSEC_RECORD_PLAIN_FIXED_BYTES = 26,
+    KSEC_RECORD_PLAIN_FLAG_GRANTS = 1
 };
 
 static const uint8_t HEADER_MAGIC[8] = {'K','S','V','L','T','0','0','1'};
@@ -165,8 +166,47 @@ out:
     return result;
 }
 
+ksec_result ksec_header_verify_master(
+        const ksec_vault_header *header,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES]) {
+    if (header == NULL || master_key == NULL) return KSEC_ERR_INVALID;
+    return verify_header(header, master_key);
+}
+
 ksec_result ksec_crypto_initialize(void) {
     return sodium_init() < 0 ? KSEC_ERR_CRYPTO : KSEC_OK;
+}
+
+ksec_result ksec_identity_anchor(
+        const uint8_t vault_uuid[KSEC_UUID_BYTES],
+        const uint8_t record_id[KSEC_RECORD_ID_BYTES], uint64_t record_revision,
+        const uint8_t public_key[KSEC_IDENTITY_KEY_BYTES],
+        uint8_t anchor[KSEC_IDENTITY_ANCHOR_BYTES]) {
+    static const uint8_t domain[8] = {
+        'K', 'S', 'E', 'C', 'I', 'D', '0', '1'
+    };
+    uint8_t input[8U + KSEC_UUID_BYTES + KSEC_RECORD_ID_BYTES + 8U
+                  + KSEC_IDENTITY_KEY_BYTES];
+    size_t offset = 0U;
+    int result;
+    if (vault_uuid == NULL || record_id == NULL || record_revision == 0U
+            || public_key == NULL || anchor == NULL) return KSEC_ERR_INVALID;
+    memcpy(input + offset, domain, sizeof domain); offset += sizeof domain;
+    memcpy(input + offset, vault_uuid, KSEC_UUID_BYTES);
+    offset += KSEC_UUID_BYTES;
+    memcpy(input + offset, record_id, KSEC_RECORD_ID_BYTES);
+    offset += KSEC_RECORD_ID_BYTES;
+    ksec_put_u64(input + offset, record_revision); offset += 8U;
+    memcpy(input + offset, public_key, KSEC_IDENTITY_KEY_BYTES);
+    offset += KSEC_IDENTITY_KEY_BYTES;
+    result = crypto_generichash(anchor, KSEC_IDENTITY_ANCHOR_BYTES,
+                                input, (unsigned long long)offset, NULL, 0U);
+    sodium_memzero(input, sizeof input);
+    if (result != 0) {
+        sodium_memzero(anchor, KSEC_IDENTITY_ANCHOR_BYTES);
+        return KSEC_ERR_CRYPTO;
+    }
+    return KSEC_OK;
 }
 
 ksec_result ksec_header_create(ksec_vault_header *header,
@@ -558,6 +598,7 @@ ksec_result ksec_record_serialize(const ksec_record *record, uint8_t *output,
     size_t type_len;
     size_t label_len;
     size_t needed = KSEC_RECORD_PLAIN_FIXED_BYTES;
+    uint16_t flags = 0U;
     size_t offset = 0;
     size_t index;
     if (record == NULL || output == NULL || output_length == NULL
@@ -565,7 +606,11 @@ ksec_result ksec_record_serialize(const ksec_record *record, uint8_t *output,
             || ksec_validate_name(record->type, KSEC_MAX_TYPE) != 0
             || ksec_validate_name(record->label, KSEC_MAX_LABEL) != 0
             || record->fields == NULL || record->field_count == 0
-            || record->field_count > KSEC_MAX_FIELDS) return KSEC_ERR_INVALID;
+            || record->field_count > KSEC_MAX_FIELDS
+            || record->grant_count > KSEC_MAX_GRANTS
+            || (record->grant_count > 0U && record->grants == NULL)) {
+        return KSEC_ERR_INVALID;
+    }
     type_len = strlen(record->type);
     label_len = strlen(record->label);
     needed += type_len + label_len;
@@ -585,14 +630,35 @@ ksec_result ksec_record_serialize(const ksec_record *record, uint8_t *output,
         if (needed > SIZE_MAX - 6U - name_len - field->value_len) return KSEC_ERR_LIMIT;
         needed += 6U + name_len + field->value_len;
     }
+    if (record->grant_count > 0U) {
+        flags = KSEC_RECORD_PLAIN_FLAG_GRANTS;
+        needed += 2U;
+    }
+    for (index = 0; index < record->grant_count; index++) {
+        const ksec_grant *grant = &record->grants[index];
+        size_t app_len;
+        if (ksec_validate_app_id(grant->application_id) != 0
+                || grant->verbs == 0U
+                || (grant->verbs & ~KSEC_GRANTABLE_VERBS) != 0U
+                || (index > 0U && strcmp(record->grants[index - 1U].application_id,
+                                         grant->application_id) >= 0)) {
+            return KSEC_ERR_INVALID;
+        }
+        app_len = strlen(grant->application_id);
+        if (needed > SIZE_MAX - 6U - app_len) return KSEC_ERR_LIMIT;
+        needed += 6U + app_len;
+    }
     if (needed > output_size || needed > KSEC_MAX_RECORD_PLAINTEXT) return KSEC_ERR_LIMIT;
     memcpy(output + offset, RECORD_PLAIN_MAGIC, sizeof RECORD_PLAIN_MAGIC); offset += 8U;
     ksec_put_u16(output + offset, KSEC_FORMAT_VERSION); offset += 2U;
-    ksec_put_u16(output + offset, 0U); offset += 2U;
+    ksec_put_u16(output + offset, flags); offset += 2U;
     ksec_put_u64(output + offset, record->expires_at); offset += 8U;
     ksec_put_u16(output + offset, (uint16_t)type_len); offset += 2U;
     ksec_put_u16(output + offset, (uint16_t)label_len); offset += 2U;
     ksec_put_u16(output + offset, (uint16_t)record->field_count); offset += 2U;
+    if ((flags & KSEC_RECORD_PLAIN_FLAG_GRANTS) != 0U) {
+        ksec_put_u16(output + offset, (uint16_t)record->grant_count); offset += 2U;
+    }
     memcpy(output + offset, record->type, type_len); offset += type_len;
     memcpy(output + offset, record->label, label_len); offset += label_len;
     for (index = 0; index < record->field_count; index++) {
@@ -602,6 +668,13 @@ ksec_result ksec_record_serialize(const ksec_record *record, uint8_t *output,
         memcpy(output + offset, record->fields[index].name, name_len); offset += name_len;
         memcpy(output + offset, record->fields[index].value,
                record->fields[index].value_len); offset += record->fields[index].value_len;
+    }
+    for (index = 0; index < record->grant_count; index++) {
+        size_t app_len = strlen(record->grants[index].application_id);
+        ksec_put_u32(output + offset, record->grants[index].verbs); offset += 4U;
+        ksec_put_u16(output + offset, (uint16_t)app_len); offset += 2U;
+        memcpy(output + offset, record->grants[index].application_id, app_len);
+        offset += app_len;
     }
     *output_length = offset;
     return KSEC_OK;
@@ -613,6 +686,8 @@ ksec_result ksec_record_parse(const uint8_t *input, size_t input_length,
     uint16_t type_len;
     uint16_t label_len;
     uint16_t field_count;
+    uint16_t flags;
+    uint16_t grant_count = 0U;
     size_t index;
     ksec_result result = KSEC_ERR_INVALID;
     if (input == NULL || record == NULL || input_length < KSEC_RECORD_PLAIN_FIXED_BYTES
@@ -624,12 +699,17 @@ ksec_result ksec_record_parse(const uint8_t *input, size_t input_length,
     offset += 8U;
     if (ksec_get_u16(input + offset) != KSEC_FORMAT_VERSION) goto fail;
     offset += 2U;
-    if (ksec_get_u16(input + offset) != 0U) goto fail;
-    offset += 2U;
+    flags = ksec_get_u16(input + offset); offset += 2U;
+    if ((flags & (uint16_t)~KSEC_RECORD_PLAIN_FLAG_GRANTS) != 0U) goto fail;
     record->expires_at = ksec_get_u64(input + offset); offset += 8U;
     type_len = ksec_get_u16(input + offset); offset += 2U;
     label_len = ksec_get_u16(input + offset); offset += 2U;
     field_count = ksec_get_u16(input + offset); offset += 2U;
+    if ((flags & KSEC_RECORD_PLAIN_FLAG_GRANTS) != 0U) {
+        if (input_length - offset < 2U) goto fail;
+        grant_count = ksec_get_u16(input + offset); offset += 2U;
+        if (grant_count == 0U || grant_count > KSEC_MAX_GRANTS) goto fail;
+    }
     if (type_len == 0 || type_len > KSEC_MAX_TYPE || label_len == 0
             || label_len > KSEC_MAX_LABEL || field_count == 0
             || field_count > KSEC_MAX_FIELDS
@@ -663,6 +743,27 @@ ksec_result ksec_record_parse(const uint8_t *input, size_t input_length,
         if (result != KSEC_OK) goto fail;
         memcpy(record->fields[index].value.data, input + offset, value_len); offset += value_len;
         record->field_count++;
+    }
+    for (index = 0; index < grant_count; index++) {
+        uint32_t verbs;
+        uint16_t app_len;
+        if (input_length - offset < 6U) goto fail;
+        verbs = ksec_get_u32(input + offset); offset += 4U;
+        app_len = ksec_get_u16(input + offset); offset += 2U;
+        if (verbs == 0U || (verbs & ~KSEC_GRANTABLE_VERBS) != 0U
+                || app_len == 0U || app_len > KSEC_MAX_APP_ID
+                || input_length - offset < app_len
+                || ksec_validate_app_id_bytes(input + offset, app_len) != 0) {
+            goto fail;
+        }
+        memcpy(record->grants[index].application_id, input + offset, app_len);
+        record->grants[index].application_id[app_len] = '\0';
+        record->grants[index].verbs = verbs;
+        offset += app_len;
+        if (index > 0U
+                && strcmp(record->grants[index - 1U].application_id,
+                          record->grants[index].application_id) >= 0) goto fail;
+        record->grant_count++;
     }
     if (offset != input_length) goto fail;
     return KSEC_OK;

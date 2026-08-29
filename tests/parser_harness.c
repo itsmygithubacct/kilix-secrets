@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #define HARNESS_MAX_INPUT (1024U * 1024U)
+#define HARNESS_MAX_STREAM_ITEM 4096U
 
 static int read_stdin(uint8_t **out, size_t *out_len) {
     uint8_t *buffer = malloc(HARNESS_MAX_INPUT);
@@ -75,47 +76,79 @@ static ksec_result parse_ad(const uint8_t *data, size_t length) {
     return result;
 }
 
+static ksec_result parse_backup(const uint8_t *data, size_t length) {
+    uint32_t vault_len = 0U;
+    uint64_t journal_len = 0U;
+    if (length < 176U) return KSEC_ERR_INVALID;
+    return ksec_backup_validate_envelope_header(data, 176U, (uint64_t)length,
+                                                &vault_len, &journal_len);
+}
+
 static void exercise_all(const uint8_t *data, size_t length) {
     (void)parse_protocol(data, length);
     (void)parse_header(data, length);
     (void)parse_record(data, length);
     (void)parse_ad(data, length);
+    (void)parse_backup(data, length);
 }
 
-static int process_stream(const uint8_t *data, size_t length) {
-    size_t offset = 0;
-    unsigned int processed = 0;
+static int read_exact_or_eof(uint8_t *buffer, size_t length, int eof_ok) {
+    size_t offset = 0U;
     while (offset < length) {
+        ssize_t count = read(STDIN_FILENO, buffer + offset, length - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return -1;
+        if (count == 0) return offset == 0U && eof_ok != 0 ? 1 : -1;
+        offset += (size_t)count;
+    }
+    return 0;
+}
+
+static int process_stream(void) {
+    uint8_t length_bytes[4];
+    uint8_t *item = malloc(HARNESS_MAX_STREAM_ITEM);
+    size_t processed = 0U;
+    int exit_code = 0;
+    if (item == NULL) return 2;
+    for (;;) {
         uint32_t item_length;
-        if (length - offset < 4U) return 2;
-        item_length = ksec_get_u32(data + offset);
-        offset += 4U;
-        if ((size_t)item_length > length - offset) return 2;
-        exercise_all(data + offset, item_length);
-        offset += item_length;
+        int read_result = read_exact_or_eof(length_bytes, sizeof length_bytes, 1);
+        if (read_result == 1) break;
+        if (read_result != 0) { exit_code = 2; break; }
+        item_length = ksec_get_u32(length_bytes);
+        if (item_length > HARNESS_MAX_STREAM_ITEM
+                || read_exact_or_eof(item, (size_t)item_length, 0) != 0) {
+            exit_code = 2;
+            break;
+        }
+        exercise_all(item, (size_t)item_length);
+        sodium_memzero(item, (size_t)item_length);
         processed++;
     }
-    printf("mutation inputs: %u/%u processed\n", processed, processed);
-    return 0;
+    sodium_memzero(item, HARNESS_MAX_STREAM_ITEM);
+    free(item);
+    sodium_memzero(length_bytes, sizeof length_bytes);
+    if (exit_code == 0) {
+        printf("mutation inputs: %zu/%zu processed\n", processed, processed);
+    }
+    return exit_code;
 }
 
 int main(int argc, char **argv) {
     uint8_t *data = NULL;
     size_t length = 0;
     ksec_result result;
-    int exit_code;
-    if (argc != 2 || ksec_crypto_initialize() != KSEC_OK
-            || read_stdin(&data, &length) != 0) return 2;
+    if (argc != 2 || ksec_crypto_initialize() != KSEC_OK) return 2;
+    if (strcmp(argv[1], "stream") == 0) return process_stream();
+    if (read_stdin(&data, &length) != 0) return 2;
     if (strcmp(argv[1], "protocol-reject") == 0) result = parse_protocol(data, length);
     else if (strcmp(argv[1], "header-reject") == 0) result = parse_header(data, length);
     else if (strcmp(argv[1], "record-reject") == 0) result = parse_record(data, length);
     else if (strcmp(argv[1], "ad-reject") == 0) result = parse_ad(data, length);
-    else if (strcmp(argv[1], "stream") == 0) {
-        exit_code = process_stream(data, length);
-        sodium_memzero(data, length);
-        free(data);
-        return exit_code;
-    } else {
+    else if (strcmp(argv[1], "backup-reject") == 0) {
+        result = parse_backup(data, length);
+    }
+    else {
         sodium_memzero(data, length);
         free(data);
         return 2;

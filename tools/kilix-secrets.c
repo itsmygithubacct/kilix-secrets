@@ -4,14 +4,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -30,9 +33,18 @@ static void usage(FILE *stream) {
             "  lock\n"
             "  passwd [--secret-fd N]\n"
             "  add --type TYPE --label LABEL --field NAME [--secret-fd N]\n"
+            "  show RECORD\n"
+            "  grant RECORD APP --verbs read,use[,replace,delete,list-own]\n"
+            "  revoke RECORD APP\n"
+            "  copy RECORD FIELD [--clear-seconds N]\n"
             "  run RECORD FIELD -- COMMAND [ARG ...]\n"
             "  list\n"
-            "  delete RECORD\n"
+            "  delete RECORD --confirm RECORD\n"
+            "  rotate [--passphrase-fd N] [--recovery-fd N]\n"
+            "  export --output FILE [--secret-fd N]\n"
+            "  import --input FILE [--secret-fd N]\n"
+            "  reset --confirm " KSEC_RESET_CONFIRMATION
+                " [--secret-fd N] [--recovery-fd N]\n"
             "  compact\n"
             "  doctor\n");
 }
@@ -47,6 +59,47 @@ static int parse_fd(const char *text, int *out) {
     }
     *out = (int)value;
     return 0;
+}
+
+static int parse_seconds(const char *text, unsigned int *out) {
+    char *end = NULL;
+    unsigned long value;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value > 60U) return -1;
+    *out = (unsigned int)value;
+    return 0;
+}
+
+static int parse_grant_verbs(const char *text, uint32_t *out) {
+    const char *cursor = text;
+    uint32_t verbs = 0U;
+    if (text == NULL || text[0] == '\0' || out == NULL) return -1;
+    while (*cursor != '\0') {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma == NULL ? strlen(cursor) : (size_t)(comma - cursor);
+        uint32_t verb;
+        if (length == 4U && memcmp(cursor, "read", 4U) == 0) {
+            verb = KSEC_VERB_READ;
+        } else if (length == 7U && memcmp(cursor, "replace", 7U) == 0) {
+            verb = KSEC_VERB_REPLACE;
+        } else if (length == 6U && memcmp(cursor, "delete", 6U) == 0) {
+            verb = KSEC_VERB_DELETE;
+        } else if (length == 8U && memcmp(cursor, "list-own", 8U) == 0) {
+            verb = KSEC_VERB_LIST_OWN;
+        } else if (length == 3U && memcmp(cursor, "use", 3U) == 0) {
+            verb = KSEC_VERB_USE;
+        } else {
+            return -1;
+        }
+        if ((verbs & verb) != 0U) return -1;
+        verbs |= verb;
+        if (comma == NULL) break;
+        cursor = comma + 1U;
+        if (*cursor == '\0') return -1;
+    }
+    *out = verbs;
+    return verbs == 0U ? -1 : 0;
 }
 
 static int prompt_secret_fd(const char *prompt, size_t minimum) {
@@ -105,9 +158,19 @@ static uint32_t command_verbs(const char *command) {
     if (strcmp(command, "unlock") == 0 || strcmp(command, "lock") == 0) return KSEC_VERB_READ;
     if (strcmp(command, "passwd") == 0) return KSEC_VERB_REPLACE;
     if (strcmp(command, "run") == 0) return KSEC_VERB_USE;
+    if (strcmp(command, "copy") == 0) return KSEC_VERB_USE;
     if (strcmp(command, "list") == 0) return KSEC_VERB_LIST_OWN;
+    if (strcmp(command, "show") == 0) return KSEC_VERB_LIST_OWN;
+    if (strcmp(command, "grant") == 0 || strcmp(command, "revoke") == 0) {
+        return KSEC_VERB_REPLACE;
+    }
     if (strcmp(command, "delete") == 0) return KSEC_VERB_DELETE;
-    if (strcmp(command, "compact") == 0) return KSEC_VERB_REPLACE;
+    if (strcmp(command, "compact") == 0 || strcmp(command, "rotate") == 0) {
+        return KSEC_VERB_REPLACE;
+    }
+    if (strcmp(command, "export") == 0) return KSEC_VERB_READ;
+    if (strcmp(command, "import") == 0) return KSEC_VERB_REPLACE;
+    if (strcmp(command, "reset") == 0) return KSEC_VERB_REPLACE;
     if (strcmp(command, "doctor") == 0) return KSEC_VERB_DOCTOR;
     return 0U;
 }
@@ -163,6 +226,250 @@ static int send_fd(int socket_fd, int passed_fd) {
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &passed_fd, sizeof passed_fd);
     return sendmsg(socket_fd, &message, MSG_NOSIGNAL) == 1 ? 0 : -1;
+}
+
+static void unlink_exact_created_file(const char *path, int fd) {
+    struct stat descriptor_status;
+    struct stat path_status;
+    if (path != NULL && fd >= 0 && fstat(fd, &descriptor_status) == 0
+            && lstat(path, &path_status) == 0
+            && S_ISREG(path_status.st_mode)
+            && descriptor_status.st_dev == path_status.st_dev
+            && descriptor_status.st_ino == path_status.st_ino) {
+        (void)unlink(path);
+    }
+}
+
+static int wait_provider(pid_t child) {
+    struct timespec pause = {0, 100000000L};
+    unsigned int attempt;
+    int status = 0;
+    for (attempt = 0U; attempt < 100U; attempt++) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+        }
+        if (result < 0 && errno != EINTR) return -1;
+        (void)nanosleep(&pause, NULL);
+    }
+    (void)kill(child, SIGTERM);
+    for (attempt = 0U; attempt < 10U; attempt++) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) return -1;
+        if (result < 0 && errno != EINTR) return -1;
+        (void)nanosleep(&pause, NULL);
+    }
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return -1;
+}
+
+static int write_provider_input(int fd, const uint8_t *data, size_t length) {
+    size_t offset = 0U;
+    unsigned int attempts = 0U;
+    int flags;
+    if (fd < 0 || (data == NULL && length > 0U)) return -1;
+    flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
+    while (offset < length && attempts < 100U) {
+        ssize_t count = write(fd, data + offset, length - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd descriptor = {fd, POLLOUT, 0};
+            int ready = poll(&descriptor, 1U, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0 || (ready > 0
+                    && (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))
+                        != 0)) return -1;
+            attempts++;
+            continue;
+        }
+        return -1;
+    }
+    return offset == length ? 0 : -1;
+}
+
+static int clipboard_provider_set(const uint8_t *data, size_t length) {
+    int input[2] = {-1, -1};
+    pid_t child;
+    int result = -1;
+    if ((data == NULL && length > 0U) || pipe2(input, O_CLOEXEC) != 0) return -1;
+    child = fork();
+    if (child < 0) goto out;
+    if (child == 0) {
+        int null_fd;
+        (void)signal(SIGPIPE, SIG_DFL);
+        (void)close(input[1]);
+        null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd < 0) {
+            (void)close(input[0]);
+            _exit(126);
+        }
+        if (dup2(input[0], STDIN_FILENO) < 0
+                || dup2(null_fd, STDOUT_FILENO) < 0) {
+            (void)close(input[0]);
+            (void)close(null_fd);
+            _exit(126);
+        }
+        (void)close(input[0]);
+        (void)close(null_fd);
+        execlp("kitty", "kitty", "+kitten", "clipboard",
+               "--wait-for-completion", (char *)NULL);
+        _exit(127);
+    }
+    (void)close(input[0]);
+    input[0] = -1;
+    if (write_provider_input(input[1], data, length) == 0
+            && close(input[1]) == 0) {
+        input[1] = -1;
+        result = wait_provider(child);
+    } else {
+        (void)close(input[1]);
+        input[1] = -1;
+        (void)kill(child, SIGTERM);
+        (void)wait_provider(child);
+    }
+out:
+    if (input[0] >= 0) (void)close(input[0]);
+    if (input[1] >= 0) (void)close(input[1]);
+    return result;
+}
+
+static int clipboard_provider_get(ksec_secure_buffer *output) {
+    int pipe_fds[2] = {-1, -1};
+    pid_t child;
+    size_t total = 0U;
+    unsigned int attempts = 0U;
+    bool eof = false;
+    int read_result = 0;
+    int result = -1;
+    if (output == NULL || pipe2(pipe_fds, O_CLOEXEC) != 0) return -1;
+    if (ksec_secure_alloc(output, KSEC_MAX_SECRET_BYTES + 1U) != KSEC_OK) {
+        goto out;
+    }
+    child = fork();
+    if (child < 0) goto out;
+    if (child == 0) {
+        int null_fd;
+        (void)signal(SIGPIPE, SIG_DFL);
+        (void)close(pipe_fds[0]);
+        null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (null_fd < 0) {
+            (void)close(pipe_fds[1]);
+            _exit(126);
+        }
+        if (dup2(null_fd, STDIN_FILENO) < 0
+                || dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+            (void)close(null_fd);
+            (void)close(pipe_fds[1]);
+            _exit(126);
+        }
+        (void)close(null_fd);
+        (void)close(pipe_fds[1]);
+        execlp("kitty", "kitty", "+kitten", "clipboard",
+               "--get-clipboard", (char *)NULL);
+        _exit(127);
+    }
+    (void)close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    while (total < output->len && !eof && attempts < 100U) {
+        struct pollfd descriptor = {pipe_fds[0], POLLIN, 0};
+        int ready = poll(&descriptor, 1U, 100);
+        ssize_t count;
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) { read_result = -1; break; }
+        if (ready == 0) { attempts++; continue; }
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            read_result = -1;
+            break;
+        }
+        if ((descriptor.revents & (POLLIN | POLLHUP)) == 0) continue;
+        count = read(pipe_fds[0], output->data + total,
+                     output->len - total);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) { read_result = -1; break; }
+        if (count == 0) { eof = true; break; }
+        total += (size_t)count;
+    }
+    if (!eof) read_result = -1;
+    if (close(pipe_fds[0]) != 0) read_result = -1;
+    pipe_fds[0] = -1;
+    if (read_result != 0) (void)kill(child, SIGTERM);
+    if (wait_provider(child) == 0 && read_result == 0
+            && total <= KSEC_MAX_SECRET_BYTES) {
+        output->len = total;
+        result = 0;
+    }
+out:
+    if (pipe_fds[0] >= 0) (void)close(pipe_fds[0]);
+    if (pipe_fds[1] >= 0) (void)close(pipe_fds[1]);
+    if (result != 0) ksec_secure_free(output);
+    return result;
+}
+
+static ksec_result copy_to_clipboard(ksec_client *client,
+                                     const uint8_t record_id[16],
+                                     const char *field,
+                                     unsigned int clear_seconds) {
+    static const char warning[] =
+        "WARNING: clipboard contents and history may expose this secret; "
+        "clearing is best-effort and is not guaranteed.\n";
+    static const char changed[] =
+        "Clipboard changed before clearing; the newer contents were left intact.\n";
+    static const char cleared[] =
+        "Clipboard clear attempted; history or another client may retain the secret.\n";
+    static const char unavailable[] =
+        "The active Kitty clipboard provider was unavailable; clipboard state could not be verified.\n";
+    ksec_secure_buffer secret = {0};
+    ksec_secure_buffer observed = {0};
+    size_t secret_len = 0U;
+    unsigned int remaining;
+    ksec_result result;
+    if (ksec_write_all(STDERR_FILENO, warning, sizeof warning - 1U) != 0) {
+        return KSEC_ERR_IO;
+    }
+    result = ksec_secure_alloc(&secret, KSEC_MAX_SECRET_BYTES);
+    if (result != KSEC_OK) return result;
+    result = ksec_get_buf(client, record_id, field, secret.data, secret.len,
+                          &secret_len);
+    if (result != KSEC_OK) goto out;
+    secret.len = secret_len;
+    if (clipboard_provider_set(secret.data, secret.len) != 0) {
+        (void)ksec_write_all(STDERR_FILENO, unavailable,
+                             sizeof unavailable - 1U);
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    remaining = clear_seconds;
+    while (remaining > 0U) remaining = sleep(remaining);
+    if (clipboard_provider_get(&observed) != 0) {
+        (void)ksec_write_all(STDERR_FILENO, unavailable,
+                             sizeof unavailable - 1U);
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (observed.len != secret.len
+            || !ksec_safe_equal(observed.data, secret.data, secret.len)) {
+        (void)ksec_write_all(STDERR_FILENO, changed, sizeof changed - 1U);
+        result = KSEC_OK;
+        goto out;
+    }
+    if (clipboard_provider_set(NULL, 0U) != 0) {
+        (void)ksec_write_all(STDERR_FILENO, unavailable,
+                             sizeof unavailable - 1U);
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    (void)ksec_write_all(STDERR_FILENO, cleared, sizeof cleared - 1U);
+    result = KSEC_OK;
+out:
+    ksec_secure_free(&observed);
+    ksec_secure_free(&secret);
+    return result;
 }
 
 static int worker_command(const cli_request *request, int capability_fd) {
@@ -321,7 +628,9 @@ init_out:
         }
         {
             ksec_field field = {field_name, value.data, value.len};
-            ksec_record record = {request->app_id, type, label, 0U, &field, 1U};
+            ksec_record record = {
+                request->app_id, type, label, 0U, &field, 1U, NULL, 0U
+            };
             result = ksec_put(client, &record, record_id);
         }
         if (result == KSEC_OK) {
@@ -340,6 +649,21 @@ add_out:
         if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
         ksec_secure_free(&value);
         sodium_memzero(record_id, sizeof record_id);
+    } else if (strcmp(command, "copy") == 0
+            && (request->argc == 3 || request->argc == 5)) {
+        uint8_t id[KSEC_RECORD_ID_BYTES];
+        unsigned int clear_seconds = 30U;
+        if (request->argc == 5
+                && (strcmp(request->argv[3], "--clear-seconds") != 0
+                    || parse_seconds(request->argv[4], &clear_seconds) != 0)) {
+            result = KSEC_ERR_INVALID;
+        } else if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0) {
+            result = KSEC_ERR_INVALID;
+        } else {
+            result = copy_to_clipboard(client, id, request->argv[2],
+                                       clear_seconds);
+        }
+        sodium_memzero(id, sizeof id);
     } else if (strcmp(command, "run") == 0 && request->argc >= 5
             && strcmp(request->argv[3], "--") == 0) {
         uint8_t id[KSEC_RECORD_ID_BYTES];
@@ -357,6 +681,7 @@ add_out:
             if (result == KSEC_OK && (written < 0 || (size_t)written >= sizeof fd_text
                     || setenv("KILIX_SECRET_FD", fd_text, 1) != 0)) result = KSEC_ERR_IO;
             if (result == KSEC_OK) {
+                (void)signal(SIGPIPE, SIG_DFL);
                 execvp(request->argv[4], request->argv + 4);
                 result = KSEC_ERR_IO;
             }
@@ -365,11 +690,251 @@ add_out:
         sodium_memzero(id, sizeof id);
     } else if (strcmp(command, "list") == 0 && request->argc == 1) {
         result = ksec_list_to_fd(client, STDOUT_FILENO);
-    } else if (strcmp(command, "delete") == 0 && request->argc == 2) {
+    } else if (strcmp(command, "show") == 0 && request->argc == 2) {
         uint8_t id[KSEC_RECORD_ID_BYTES];
-        if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0) result = KSEC_ERR_INVALID;
-        else result = ksec_delete(client, id);
+        if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0) {
+            result = KSEC_ERR_INVALID;
+        } else {
+            result = ksec_show_to_fd(client, id, STDOUT_FILENO);
+        }
         sodium_memzero(id, sizeof id);
+    } else if (strcmp(command, "grant") == 0 && request->argc == 5
+            && strcmp(request->argv[3], "--verbs") == 0) {
+        uint8_t id[KSEC_RECORD_ID_BYTES];
+        uint32_t verbs = 0U;
+        if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0
+                || parse_grant_verbs(request->argv[4], &verbs) != 0) {
+            result = KSEC_ERR_INVALID;
+        } else {
+            result = ksec_grant_record(client, id, request->argv[2], verbs);
+        }
+        sodium_memzero(id, sizeof id);
+    } else if (strcmp(command, "revoke") == 0 && request->argc == 3) {
+        uint8_t id[KSEC_RECORD_ID_BYTES];
+        if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0) {
+            result = KSEC_ERR_INVALID;
+        } else {
+            result = ksec_revoke_record(client, id, request->argv[2]);
+        }
+        sodium_memzero(id, sizeof id);
+    } else if (strcmp(command, "delete") == 0 && request->argc == 4
+            && strcmp(request->argv[2], "--confirm") == 0) {
+        uint8_t id[KSEC_RECORD_ID_BYTES];
+        uint8_t confirmation[KSEC_RECORD_ID_BYTES];
+        if (ksec_hex_decode(request->argv[1], id, sizeof id) != 0
+                || ksec_hex_decode(request->argv[3], confirmation,
+                                   sizeof confirmation) != 0
+                || !ksec_safe_equal(id, confirmation, sizeof id)) {
+            result = KSEC_ERR_INVALID;
+        } else {
+            result = ksec_delete(client, id);
+        }
+        sodium_memzero(id, sizeof id);
+        sodium_memzero(confirmation, sizeof confirmation);
+    } else if (strcmp(command, "rotate") == 0) {
+        int passphrase_fd = -1;
+        int recovery_fd = -1;
+        int index;
+        for (index = 1; index < request->argc; index++) {
+            if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--passphrase-fd") == 0
+                    && passphrase_fd < 0) {
+                if (parse_fd(request->argv[++index], &passphrase_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto rotate_out;
+                }
+            } else if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--recovery-fd") == 0
+                    && recovery_fd < 0) {
+                if (parse_fd(request->argv[++index], &recovery_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto rotate_out;
+                }
+            } else {
+                result = KSEC_ERR_INVALID;
+                goto rotate_out;
+            }
+        }
+        if (passphrase_fd < 0) {
+            passphrase_fd = prompt_secret_fd("Current passphrase: ", 8U);
+        }
+        if (recovery_fd < 0) {
+            recovery_fd = prompt_secret_fd("Recovery secret: ", 64U);
+        }
+        if (passphrase_fd < 0 || recovery_fd < 0) result = KSEC_ERR_INVALID;
+        else result = ksec_rotate_master(client, passphrase_fd, recovery_fd);
+rotate_out:
+        if (passphrase_fd > STDERR_FILENO) (void)close(passphrase_fd);
+        if (recovery_fd > STDERR_FILENO) (void)close(recovery_fd);
+        if (result == KSEC_OK) {
+            static const char notice[] =
+                "Master key rotated; the prior encrypted generation is retained for explicit recovery.\n";
+            (void)ksec_write_all(STDERR_FILENO, notice, sizeof notice - 1U);
+        }
+    } else if (strcmp(command, "export") == 0) {
+        const char *output_path = NULL;
+        int secret_fd = -1;
+        int output_fd = -1;
+        int index;
+        for (index = 1; index < request->argc; index++) {
+            if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--output") == 0
+                    && output_path == NULL) {
+                output_path = request->argv[++index];
+            } else if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--secret-fd") == 0
+                    && secret_fd < 0) {
+                if (parse_fd(request->argv[++index], &secret_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto export_out;
+                }
+            } else {
+                result = KSEC_ERR_INVALID;
+                goto export_out;
+            }
+        }
+        if (output_path == NULL || output_path[0] == '\0') {
+            result = KSEC_ERR_INVALID;
+            goto export_out;
+        }
+        output_fd = open(output_path,
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                         0600);
+        if (output_fd < 0) {
+            result = errno == EEXIST ? KSEC_ERR_EXISTS : KSEC_ERR_IO;
+            goto export_out;
+        }
+        if (secret_fd < 0) {
+            secret_fd = prompt_secret_fd(
+                    "Backup passphrase or recovery secret: ", 8U);
+        }
+        if (secret_fd < 0) result = KSEC_ERR_INVALID;
+        else result = ksec_export_backup(client, secret_fd, output_fd);
+export_out:
+        if (result != KSEC_OK && output_fd >= 0) {
+            unlink_exact_created_file(output_path, output_fd);
+        }
+        if (output_fd >= 0 && close(output_fd) != 0 && result == KSEC_OK) {
+            result = KSEC_ERR_IO;
+        }
+        if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
+        if (result == KSEC_OK) {
+            static const char notice[] =
+                "Encrypted backup created; its passphrase or recovery secret is required for restore.\n";
+            (void)ksec_write_all(STDERR_FILENO, notice, sizeof notice - 1U);
+        }
+    } else if (strcmp(command, "import") == 0) {
+        const char *input_path = NULL;
+        int secret_fd = -1;
+        int input_fd = -1;
+        int index;
+        for (index = 1; index < request->argc; index++) {
+            if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--input") == 0
+                    && input_path == NULL) {
+                input_path = request->argv[++index];
+            } else if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--secret-fd") == 0
+                    && secret_fd < 0) {
+                if (parse_fd(request->argv[++index], &secret_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto import_out;
+                }
+            } else {
+                result = KSEC_ERR_INVALID;
+                goto import_out;
+            }
+        }
+        if (input_path == NULL || input_path[0] == '\0') {
+            result = KSEC_ERR_INVALID;
+            goto import_out;
+        }
+        input_fd = open(input_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (input_fd < 0) {
+            result = KSEC_ERR_IO;
+            goto import_out;
+        }
+        if (secret_fd < 0) {
+            secret_fd = prompt_secret_fd(
+                    "Backup passphrase or recovery secret: ", 8U);
+        }
+        if (secret_fd < 0) result = KSEC_ERR_INVALID;
+        else result = ksec_import_backup(client, secret_fd, input_fd);
+import_out:
+        if (input_fd >= 0) (void)close(input_fd);
+        if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
+        if (result == KSEC_OK) {
+            static const char notice[] =
+                "Backup restored and vault locked. Restoring an older valid backup is an explicit rollback; portable storage has no trusted rollback counter.\n";
+            (void)ksec_write_all(STDERR_FILENO, notice, sizeof notice - 1U);
+        }
+    } else if (strcmp(command, "reset") == 0) {
+        const char *confirmation = NULL;
+        int secret_fd = -1;
+        int recovery_fd = -1;
+        int index;
+        for (index = 1; index < request->argc; index++) {
+            if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--confirm") == 0
+                    && confirmation == NULL) {
+                confirmation = request->argv[++index];
+            } else if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--secret-fd") == 0
+                    && secret_fd < 0) {
+                if (parse_fd(request->argv[++index], &secret_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto reset_out;
+                }
+            } else if (index + 1 < request->argc
+                    && strcmp(request->argv[index], "--recovery-fd") == 0
+                    && recovery_fd < 0) {
+                if (parse_fd(request->argv[++index], &recovery_fd) != 0) {
+                    result = KSEC_ERR_INVALID;
+                    goto reset_out;
+                }
+            } else {
+                result = KSEC_ERR_INVALID;
+                goto reset_out;
+            }
+        }
+        if (confirmation == NULL
+                || strcmp(confirmation, KSEC_RESET_CONFIRMATION) != 0) {
+            result = KSEC_ERR_INVALID;
+            goto reset_out;
+        }
+        if (secret_fd < 0) {
+            secret_fd = prompt_secret_fd("New vault passphrase: ", 8U);
+        }
+        if (recovery_fd < 0) {
+            recovery_fd = open("/dev/tty", O_WRONLY | O_CLOEXEC | O_NOCTTY);
+            if (recovery_fd >= 0) {
+                static const char warning[] =
+                    "New recovery secret (record it offline; reset loses the prior identity):\n";
+                if (ksec_write_all(recovery_fd, warning,
+                                   sizeof warning - 1U) != 0) {
+                    (void)close(recovery_fd);
+                    recovery_fd = -1;
+                }
+            }
+        }
+        if (secret_fd < 0 || recovery_fd < 0) result = KSEC_ERR_INVALID;
+        else {
+            result = ksec_reset_vault(client, confirmation, secret_fd,
+                                      recovery_fd);
+            if (result == KSEC_OK
+                    && ksec_write_all(recovery_fd, "\n", 1U) != 0) {
+                result = KSEC_ERR_IO;
+            }
+        }
+reset_out:
+        if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
+        if (recovery_fd > STDERR_FILENO) (void)close(recovery_fd);
+        if (result == KSEC_OK) {
+            static const char notice[] =
+                "Vault reset created a new identity and retained the displaced encrypted vault. All peers require revocation or re-pairing. The new vault remains locked until recovery confirmation.\n";
+            (void)ksec_write_all(STDERR_FILENO, notice,
+                                 sizeof notice - 1U);
+        }
     } else if (strcmp(command, "compact") == 0 && request->argc == 1) {
         result = ksec_compact(client);
     } else if (strcmp(command, "doctor") == 0 && request->argc == 1) {
@@ -432,7 +997,9 @@ int main(int argc, char **argv) {
     int index = 1;
     uint32_t verbs;
     int count;
-    if (ksec_crypto_initialize() != KSEC_OK) return 1;
+    if (ksec_crypto_initialize() != KSEC_OK || signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        return 1;
+    }
     memset(&request, 0, sizeof request);
     request.app_id = "kilix-secrets";
     while (index < argc) {

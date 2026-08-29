@@ -270,7 +270,13 @@ int ksec_process_start_time(pid_t pid, uint64_t *out) {
     fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     count = read(fd, buffer, sizeof buffer - 1U);
-    if (count <= 0 || close(fd) != 0) return -1;
+    if (count <= 0) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (close(fd) != 0) return -1;
     buffer[(size_t)count] = '\0';
     tail = strrchr(buffer, ')');
     if (tail == NULL || tail[1] != ' ') return -1;
@@ -339,6 +345,7 @@ const char *ksec_result_string(ksec_result result) {
         case KSEC_ERR_EXISTS: return "already exists";
         case KSEC_ERR_AUDIT: return "audit unavailable";
         case KSEC_ERR_MEMORY: return "secure memory unavailable";
+        case KSEC_ERR_CONFLICT: return "identity generation conflict";
     }
     return "unknown result";
 }

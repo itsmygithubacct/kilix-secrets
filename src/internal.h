@@ -47,9 +47,20 @@
 #define KSEC_MAX_OWNER_BYTES KSEC_MAX_APP_ID
 #define KSEC_MAX_RECORD_PLAINTEXT (KSEC_MAX_SECRET_BYTES + 4096U)
 #define KSEC_MAX_JOURNAL_BYTES (UINT64_C(128) * UINT64_C(1024) * UINT64_C(1024))
+#define KSEC_MAX_BACKUP_BYTES (KSEC_MAX_JOURNAL_BYTES + UINT64_C(4096))
 #define KSEC_MAX_AUDIT_BYTES (UINT64_C(4) * UINT64_C(1024) * UINT64_C(1024))
 #define KSEC_MAX_CAPABILITIES 256U
 #define KSEC_MAX_CONNECTIONS 64U
+
+#define KSEC_IDENTITY_FRAME_MAGIC UINT32_C(0x4b534944)
+#define KSEC_IDENTITY_FRAME_VERSION 1U
+#define KSEC_IDENTITY_FRAME_BYTES 144U
+#define KSEC_IDENTITY_INFO_FRAME_MAGIC UINT32_C(0x4b534950)
+#define KSEC_IDENTITY_INFO_FRAME_BYTES 112U
+
+#define KSEC_GRANTABLE_VERBS \
+    ((uint32_t)(KSEC_VERB_READ | KSEC_VERB_REPLACE | KSEC_VERB_DELETE \
+                | KSEC_VERB_LIST_OWN | KSEC_VERB_USE))
 
 #define KSEC_RECORD_AD_FIXED_BYTES 62U
 #define KSEC_SLOT_AD_FIXED_BYTES 68U
@@ -89,6 +100,11 @@ typedef struct {
 } ksec_owned_field;
 
 typedef struct {
+    char application_id[KSEC_MAX_APP_ID + 1U];
+    uint32_t verbs;
+} ksec_owned_grant;
+
+typedef struct {
     uint8_t id[KSEC_RECORD_ID_BYTES];
     char owner[KSEC_MAX_APP_ID + 1U];
     char type[KSEC_MAX_TYPE + 1U];
@@ -98,10 +114,13 @@ typedef struct {
     uint64_t expires_at;
     size_t field_count;
     ksec_owned_field fields[KSEC_MAX_FIELDS];
+    size_t grant_count;
+    ksec_owned_grant grants[KSEC_MAX_GRANTS];
     bool deleted;
 } ksec_owned_record;
 
 typedef struct {
+    char root_dir[4096];
     char data_dir[4096];
     char vault_path[4096];
     char journal_path[4096];
@@ -133,6 +152,15 @@ typedef struct {
     ksec_capability entries[KSEC_MAX_CAPABILITIES];
 } ksec_policy;
 
+typedef struct {
+    uint8_t *vault;
+    size_t vault_len;
+    uint8_t *journal;
+    size_t journal_len;
+    ksec_vault_header header;
+    ksec_secure_buffer master;
+} ksec_backup_image;
+
 typedef enum {
     KSEC_OP_ACTIVATE = 1,
     KSEC_OP_MINT = 2,
@@ -147,7 +175,16 @@ typedef enum {
     KSEC_OP_DOCTOR = 11,
     KSEC_OP_COMPACT = 12,
     KSEC_OP_CHANGE_PASSPHRASE = 13,
-    KSEC_OP_MAX = KSEC_OP_CHANGE_PASSPHRASE
+    KSEC_OP_ROTATE_MASTER = 14,
+    KSEC_OP_EXPORT_BACKUP = 15,
+    KSEC_OP_IMPORT_BACKUP = 16,
+    KSEC_OP_SHOW = 17,
+    KSEC_OP_GRANT = 18,
+    KSEC_OP_REVOKE = 19,
+    KSEC_OP_RESET_VAULT = 20,
+    KSEC_OP_IDENTITY_OPEN = 21,
+    KSEC_OP_IDENTITY_INFO = 22,
+    KSEC_OP_MAX = KSEC_OP_IDENTITY_INFO
 } ksec_operation;
 
 typedef struct {
@@ -184,6 +221,11 @@ int ksec_hex_decode(const char *input, uint8_t *output, size_t output_length);
 
 ksec_result ksec_secure_alloc(ksec_secure_buffer *buffer, size_t length);
 void ksec_secure_free(ksec_secure_buffer *buffer);
+ksec_result ksec_identity_anchor(
+        const uint8_t vault_uuid[KSEC_UUID_BYTES],
+        const uint8_t record_id[KSEC_RECORD_ID_BYTES], uint64_t record_revision,
+        const uint8_t public_key[KSEC_IDENTITY_KEY_BYTES],
+        uint8_t anchor[KSEC_IDENTITY_ANCHOR_BYTES]);
 typedef enum {
     KSEC_TEST_STORE_HEADER_OPEN = 1,
     KSEC_TEST_STORE_HEADER_WRITE = 2,
@@ -201,7 +243,34 @@ typedef enum {
     KSEC_TEST_STORE_COMPACT_FSYNC = 14,
     KSEC_TEST_STORE_COMPACT_CLOSE = 15,
     KSEC_TEST_STORE_COMPACT_RENAME = 16,
-    KSEC_TEST_STORE_COMPACT_DIRSYNC = 17
+    KSEC_TEST_STORE_COMPACT_DIRSYNC = 17,
+    KSEC_TEST_STORE_ROTATE_DIRECTORY = 18,
+    KSEC_TEST_STORE_ROTATE_HEADER = 19,
+    KSEC_TEST_STORE_ROTATE_JOURNAL = 20,
+    KSEC_TEST_STORE_ROTATE_VERIFY = 21,
+    KSEC_TEST_STORE_ROTATE_PRESYNC = 22,
+    KSEC_TEST_STORE_ROTATE_EXCHANGE = 23,
+    KSEC_TEST_STORE_ROTATE_POSTSYNC = 24,
+    KSEC_TEST_STORE_ROTATE_RETAIN = 25,
+    KSEC_TEST_STORE_ROTATE_RETAIN_SYNC = 26,
+    KSEC_TEST_STORE_IMPORT_DIRECTORY = 27,
+    KSEC_TEST_STORE_IMPORT_VAULT = 28,
+    KSEC_TEST_STORE_IMPORT_JOURNAL = 29,
+    KSEC_TEST_STORE_IMPORT_VERIFY = 30,
+    KSEC_TEST_STORE_IMPORT_PRESYNC = 31,
+    KSEC_TEST_STORE_IMPORT_EXCHANGE = 32,
+    KSEC_TEST_STORE_IMPORT_POSTSYNC = 33,
+    KSEC_TEST_STORE_IMPORT_RETAIN = 34,
+    KSEC_TEST_STORE_IMPORT_RETAIN_SYNC = 35,
+    KSEC_TEST_STORE_RESET_DIRECTORY = 36,
+    KSEC_TEST_STORE_RESET_VAULT = 37,
+    KSEC_TEST_STORE_RESET_JOURNAL = 38,
+    KSEC_TEST_STORE_RESET_VERIFY = 39,
+    KSEC_TEST_STORE_RESET_PRESYNC = 40,
+    KSEC_TEST_STORE_RESET_EXCHANGE = 41,
+    KSEC_TEST_STORE_RESET_POSTSYNC = 42,
+    KSEC_TEST_STORE_RESET_RETAIN = 43,
+    KSEC_TEST_STORE_RESET_RETAIN_SYNC = 44
 } ksec_test_store_point;
 
 #ifdef KSEC_TESTING
@@ -255,6 +324,9 @@ ksec_result ksec_header_rotate_master(
         const uint8_t *passphrase, size_t passphrase_len,
         const uint8_t *recovery, size_t recovery_len,
         uint32_t opslimit, uint64_t memlimit);
+ksec_result ksec_header_verify_master(
+        const ksec_vault_header *header,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES]);
 ksec_result ksec_header_encode(const ksec_vault_header *header, uint8_t *output,
                                size_t output_size, size_t *output_length);
 ksec_result ksec_header_decode(const uint8_t *input, size_t input_length,
@@ -302,6 +374,14 @@ ksec_owned_record *ksec_store_find(ksec_store *store,
 ksec_result ksec_store_compact(ksec_store *store,
                                const ksec_vault_header *header,
                                const uint8_t master_key[KSEC_MASTER_KEY_BYTES]);
+ksec_result ksec_store_rotate_generation(
+        ksec_store *store, const ksec_vault_header *new_header,
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES]);
+ksec_result ksec_store_import_generation(ksec_store *store,
+                                         const ksec_backup_image *image);
+ksec_result ksec_store_reset_generation(
+        ksec_store *store, const ksec_vault_header *new_header,
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES]);
 
 void ksec_policy_init(ksec_policy *policy);
 void ksec_policy_clear(ksec_policy *policy);
@@ -320,6 +400,17 @@ ksec_result ksec_audit_open(const char *data_dir, int *out_fd);
 ksec_result ksec_audit_event(int fd, const char *event, const char *outcome,
                              uid_t uid, pid_t pid, const char *app_id,
                              const uint8_t *record_id);
+
+ksec_result ksec_backup_create(
+        const ksec_store *store, const ksec_vault_header *header,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t *passphrase, size_t passphrase_len, int output_fd);
+ksec_result ksec_backup_open(int input_fd, const uint8_t *passphrase,
+                             size_t passphrase_len, ksec_backup_image *image);
+ksec_result ksec_backup_validate_envelope_header(
+        const uint8_t *header, size_t header_len, uint64_t artifact_len,
+        uint32_t *vault_len, uint64_t *journal_len);
+void ksec_backup_image_clear(ksec_backup_image *image);
 
 ksec_result ksec_packet_encode(const ksec_packet_header *header,
                                const uint8_t *payload, uint8_t *output,

@@ -5,11 +5,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/fs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 enum {
@@ -178,6 +180,43 @@ static int open_unique_temporary(const char *directory, const char *stem,
     return -1;
 }
 
+static int create_unique_directory(const char *root, const char *stem,
+                                   char *path, size_t path_size, int point) {
+    unsigned int attempt;
+    if (store_test_before(point, -1, NULL, 0U) != 0) return -1;
+    for (attempt = 0U; attempt < 32U; attempt++) {
+        uint8_t suffix[8];
+        char suffix_hex[17];
+        int count;
+        randombytes_buf(suffix, sizeof suffix);
+        ksec_hex_encode(suffix, sizeof suffix, suffix_hex);
+        sodium_memzero(suffix, sizeof suffix);
+        count = snprintf(path, path_size, "%s/.%s.%ld.%s", root, stem,
+                         (long)getpid(), suffix_hex);
+        sodium_memzero(suffix_hex, sizeof suffix_hex);
+        if (count < 0 || (size_t)count >= path_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (mkdir(path, 0700) == 0) {
+            store_test_after(point);
+            return 0;
+        }
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+static int store_exchange_directories(const char *left, const char *right,
+                                      int point) {
+    if (store_test_before(point, -1, NULL, 0U) != 0) return -1;
+    if (syscall(SYS_renameat2, AT_FDCWD, left, AT_FDCWD, right,
+                RENAME_EXCHANGE) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
 static int sync_parent_directory(const char *path) {
     char parent[4096];
     if (ksec_parent_directory(path, parent, sizeof parent) != 0) return -1;
@@ -257,6 +296,7 @@ static ksec_result apply_loaded_record(ksec_store *store, ksec_owned_record *rec
 static ksec_result owned_record_plaintext(const ksec_owned_record *record,
                                           ksec_secure_buffer *plaintext) {
     ksec_field fields[KSEC_MAX_FIELDS];
+    ksec_grant grants[KSEC_MAX_GRANTS];
     ksec_record public_record;
     size_t index;
     size_t output_len = 0;
@@ -268,12 +308,18 @@ static ksec_result owned_record_plaintext(const ksec_owned_record *record,
         fields[index].value = record->fields[index].value.data;
         fields[index].value_len = record->fields[index].value.len;
     }
+    for (index = 0; index < record->grant_count; index++) {
+        grants[index].application_id = record->grants[index].application_id;
+        grants[index].verbs = record->grants[index].verbs;
+    }
     public_record.owner = record->owner;
     public_record.type = record->type;
     public_record.label = record->label;
     public_record.expires_at = record->expires_at;
     public_record.fields = fields;
     public_record.field_count = record->field_count;
+    public_record.grants = record->grant_count > 0U ? grants : NULL;
+    public_record.grant_count = record->grant_count;
     result = ksec_record_serialize(&public_record, plaintext->data, plaintext->len,
                                    &output_len);
     if (result != KSEC_OK) {
@@ -364,13 +410,15 @@ out:
 
 ksec_result ksec_store_open(ksec_store *store, const char *data_dir, bool create) {
     char parent[4096];
+    char current[4096];
+    struct stat status;
     int fd;
     if (store == NULL || data_dir == NULL || data_dir[0] != '/') return KSEC_ERR_INVALID;
     memset(store, 0, sizeof *store);
     store->lock_fd = -1;
-    if (strlen(data_dir) >= sizeof store->data_dir) return KSEC_ERR_LIMIT;
-    memcpy(store->data_dir, data_dir, strlen(data_dir) + 1U);
-    if (lstat(data_dir, &(struct stat){0}) != 0) {
+    if (strlen(data_dir) >= sizeof store->root_dir) return KSEC_ERR_LIMIT;
+    memcpy(store->root_dir, data_dir, strlen(data_dir) + 1U);
+    if (lstat(data_dir, &status) != 0) {
         if (!create || errno != ENOENT
                 || ksec_parent_directory(data_dir, parent, sizeof parent) != 0
                 || ksec_validate_secure_directory(parent, false) != 0
@@ -378,8 +426,18 @@ ksec_result ksec_store_open(ksec_store *store, const char *data_dir, bool create
         if (sync_parent_directory(data_dir) != 0 && errno != EINVAL) return KSEC_ERR_IO;
     }
     if (ksec_validate_secure_directory(data_dir, true) != 0) return KSEC_ERR_DENIED;
-    if (make_path(store->vault_path, sizeof store->vault_path, data_dir, "vault.ksv") != 0
-            || make_path(store->journal_path, sizeof store->journal_path, data_dir, "journal.ksj") != 0
+    if (make_path(current, sizeof current, data_dir, "vault-current") != 0) {
+        return KSEC_ERR_LIMIT;
+    }
+    if (lstat(current, &status) != 0) {
+        if (errno != ENOENT || mkdir(current, 0700) != 0
+                || ksec_sync_directory(data_dir) != 0) return KSEC_ERR_IO;
+    }
+    if (ksec_validate_secure_directory(current, true) != 0
+            || strlen(current) >= sizeof store->data_dir) return KSEC_ERR_DENIED;
+    memcpy(store->data_dir, current, strlen(current) + 1U);
+    if (make_path(store->vault_path, sizeof store->vault_path, current, "vault.ksv") != 0
+            || make_path(store->journal_path, sizeof store->journal_path, current, "journal.ksj") != 0
             || make_path(store->lock_path, sizeof store->lock_path, data_dir, "writer.lock") != 0) {
         return KSEC_ERR_LIMIT;
     }
@@ -801,5 +859,495 @@ ksec_result ksec_store_compact(ksec_store *store,
     }
     if (result != KSEC_OK) (void)unlink(temporary);
     free(ordered);
+    return result;
+}
+
+static bool records_equal(const ksec_owned_record *left,
+                          const ksec_owned_record *right) {
+    size_t index;
+    if (left == NULL || right == NULL
+            || sodium_memcmp(left->id, right->id, KSEC_RECORD_ID_BYTES) != 0
+            || strcmp(left->owner, right->owner) != 0
+            || strcmp(left->type, right->type) != 0
+            || strcmp(left->label, right->label) != 0
+            || left->object_type != right->object_type
+            || left->revision != right->revision
+            || left->expires_at != right->expires_at
+            || left->field_count != right->field_count
+            || left->grant_count != right->grant_count
+            || left->deleted != right->deleted) return false;
+    for (index = 0U; index < left->field_count; index++) {
+        if (strcmp(left->fields[index].name, right->fields[index].name) != 0
+                || left->fields[index].value.len
+                    != right->fields[index].value.len
+                || sodium_memcmp(left->fields[index].value.data,
+                                 right->fields[index].value.data,
+                                 left->fields[index].value.len) != 0) {
+            return false;
+        }
+    }
+    for (index = 0U; index < left->grant_count; index++) {
+        if (strcmp(left->grants[index].application_id,
+                   right->grants[index].application_id) != 0
+                || left->grants[index].verbs != right->grants[index].verbs) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool stores_equal(const ksec_store *left, const ksec_store *right) {
+    size_t index;
+    if (left == NULL || right == NULL
+            || left->record_count != right->record_count
+            || left->last_revision != right->last_revision
+            || right->torn_tail) return false;
+    for (index = 0U; index < left->record_count; index++) {
+        size_t other;
+        bool found = false;
+        for (other = 0U; other < right->record_count; other++) {
+            if (sodium_memcmp(left->records[index].id,
+                              right->records[other].id,
+                              KSEC_RECORD_ID_BYTES) == 0) {
+                found = records_equal(&left->records[index],
+                                      &right->records[other]);
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+static int initialize_generation_store(ksec_store *generation,
+                                       const char *root,
+                                       const char *directory) {
+    if (generation == NULL || root == NULL || directory == NULL
+            || strlen(root) >= sizeof generation->root_dir
+            || strlen(directory) >= sizeof generation->data_dir) return -1;
+    memset(generation, 0, sizeof *generation);
+    generation->lock_fd = -1;
+    memcpy(generation->root_dir, root, strlen(root) + 1U);
+    memcpy(generation->data_dir, directory, strlen(directory) + 1U);
+    if (make_path(generation->vault_path, sizeof generation->vault_path,
+                  directory, "vault.ksv") != 0
+            || make_path(generation->journal_path,
+                         sizeof generation->journal_path, directory,
+                         "journal.ksj") != 0) return -1;
+    return 0;
+}
+
+static int complete_rotation_stage(int point) {
+    if (store_test_before(point, -1, NULL, 0U) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
+static ksec_result write_generation_file(const char *directory,
+                                         const char *path,
+                                         const uint8_t *bytes, size_t length,
+                                         int point) {
+    int fd;
+    if (directory == NULL || path == NULL
+            || (bytes == NULL && length > 0U)) return KSEC_ERR_INVALID;
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+              0600);
+    if (fd < 0) return KSEC_ERR_IO;
+    if (safe_regular_fd(fd, 0600) != 0
+            || store_test_before(point, fd, bytes, length) != 0
+            || ksec_write_all(fd, bytes, length) != 0
+            || fsync(fd) != 0) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return KSEC_ERR_IO;
+    }
+    if (close(fd) != 0) return KSEC_ERR_IO;
+    if (ksec_sync_directory(directory) != 0) return KSEC_ERR_IO;
+    store_test_after(point);
+    return KSEC_OK;
+}
+
+ksec_result ksec_store_rotate_generation(
+        ksec_store *store, const ksec_vault_header *new_header,
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES]) {
+    ksec_store staged;
+    ksec_store verification;
+    ksec_vault_header old_header;
+    ksec_vault_header verified_header;
+    uint8_t expected_header[1024];
+    uint8_t observed_header[1024];
+    size_t expected_header_len = 0U;
+    size_t observed_header_len = 0U;
+    char staging_path[4096];
+    char retained_path[4096];
+    const char *suffix;
+    int count;
+    bool exchanged = false;
+    ksec_result result;
+    memset(&staged, 0, sizeof staged);
+    memset(&verification, 0, sizeof verification);
+    memset(&old_header, 0, sizeof old_header);
+    memset(&verified_header, 0, sizeof verified_header);
+    if (store == NULL || new_header == NULL || new_master_key == NULL
+            || store->lock_fd < 0 || store->root_dir[0] != '/'
+            || store->data_dir[0] != '/' || store->torn_tail) {
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_store_read_header(store, &old_header);
+    if (result != KSEC_OK) goto out;
+    if (new_header->format_version != old_header.format_version
+            || sodium_memcmp(new_header->vault_uuid, old_header.vault_uuid,
+                             KSEC_UUID_BYTES) != 0
+            || old_header.generation == UINT64_MAX
+            || new_header->generation != old_header.generation + 1U
+            || (new_header->flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) == 0U) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    result = ksec_header_verify_master(new_header, new_master_key);
+    if (result != KSEC_OK) goto out;
+    if (create_unique_directory(store->root_dir, "vault-rotation",
+                                staging_path, sizeof staging_path,
+                                KSEC_TEST_STORE_ROTATE_DIRECTORY) != 0
+            || initialize_generation_store(&staged, store->root_dir,
+                                           staging_path) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    staged.records = store->records;
+    staged.record_count = store->record_count;
+    staged.last_revision = store->last_revision;
+    result = ksec_store_write_header(&staged, new_header);
+    if (result != KSEC_OK
+            || complete_rotation_stage(KSEC_TEST_STORE_ROTATE_HEADER) != 0) {
+        if (result == KSEC_OK) result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = ksec_store_compact(&staged, new_header, new_master_key);
+    if (result != KSEC_OK
+            || complete_rotation_stage(KSEC_TEST_STORE_ROTATE_JOURNAL) != 0) {
+        if (result == KSEC_OK) result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (initialize_generation_store(&verification, store->root_dir,
+                                    staging_path) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = ksec_store_read_header(&verification, &verified_header);
+    if (result == KSEC_OK) {
+        result = ksec_header_verify_master(&verified_header, new_master_key);
+    }
+    if (result == KSEC_OK) {
+        result = ksec_header_encode(new_header, expected_header,
+                                    sizeof expected_header,
+                                    &expected_header_len);
+    }
+    if (result == KSEC_OK) {
+        result = ksec_header_encode(&verified_header, observed_header,
+                                    sizeof observed_header,
+                                    &observed_header_len);
+    }
+    if (result == KSEC_OK && (expected_header_len != observed_header_len
+            || sodium_memcmp(expected_header, observed_header,
+                             expected_header_len) != 0)) {
+        result = KSEC_ERR_CRYPTO;
+    }
+    if (result == KSEC_OK) {
+        result = ksec_store_load(&verification, &verified_header,
+                                 new_master_key);
+    }
+    if (result == KSEC_OK && !stores_equal(store, &verification)) {
+        result = KSEC_ERR_CRYPTO;
+    }
+    if (result != KSEC_OK
+            || complete_rotation_stage(KSEC_TEST_STORE_ROTATE_VERIFY) != 0) {
+        if (result == KSEC_OK) result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (store_directory_sync(store->root_dir,
+                             KSEC_TEST_STORE_ROTATE_PRESYNC) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (store_exchange_directories(store->data_dir, staging_path,
+                                   KSEC_TEST_STORE_ROTATE_EXCHANGE) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    exchanged = true;
+    if (store_directory_sync(store->root_dir,
+                             KSEC_TEST_STORE_ROTATE_POSTSYNC) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    suffix = strrchr(staging_path, '.');
+    if (suffix == NULL) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    count = snprintf(retained_path, sizeof retained_path,
+                     "%s/.vault-previous-%llu.%ld%s", store->root_dir,
+                     (unsigned long long)old_header.generation,
+                     (long)getpid(), suffix);
+    if (count < 0 || (size_t)count >= sizeof retained_path
+            || store_rename(staging_path, retained_path,
+                            KSEC_TEST_STORE_ROTATE_RETAIN) != 0
+            || store_directory_sync(store->root_dir,
+                                    KSEC_TEST_STORE_ROTATE_RETAIN_SYNC) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = KSEC_OK;
+out:
+    if (exchanged && result != KSEC_OK) {
+        store->torn_tail = true;
+    }
+    clear_records(&verification);
+    verification.lock_fd = -1;
+    staged.records = NULL;
+    staged.record_count = 0U;
+    sodium_memzero(&staged, sizeof staged);
+    sodium_memzero(&verification, sizeof verification);
+    sodium_memzero(&old_header, sizeof old_header);
+    sodium_memzero(&verified_header, sizeof verified_header);
+    sodium_memzero(expected_header, sizeof expected_header);
+    sodium_memzero(observed_header, sizeof observed_header);
+    return result;
+}
+
+typedef struct {
+    const char *staging_name;
+    const char *retained_name;
+    int directory;
+    int vault;
+    int journal;
+    int verify;
+    int presync;
+    int exchange;
+    int postsync;
+    int retain;
+    int retain_sync;
+    bool require_confirmed;
+    bool require_new_identity;
+} generation_install_policy;
+
+static ksec_result install_generation(
+        ksec_store *store, const ksec_vault_header *header,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t *vault, size_t vault_len,
+        const uint8_t *journal, size_t journal_len,
+        const generation_install_policy *policy) {
+    ksec_store staged;
+    ksec_store verification;
+    ksec_vault_header old_header;
+    ksec_vault_header verified_header;
+    uint8_t expected_header[HEADER_MAX_BYTES];
+    uint8_t observed_header[HEADER_MAX_BYTES];
+    size_t expected_header_len = 0U;
+    size_t observed_header_len = 0U;
+    char staging_path[4096];
+    char retained_path[4096];
+    const char *suffix;
+    int count;
+    bool exchanged = false;
+    bool old_header_known = false;
+    ksec_result result = KSEC_ERR_INVALID;
+    memset(&staged, 0, sizeof staged);
+    memset(&verification, 0, sizeof verification);
+    memset(&old_header, 0, sizeof old_header);
+    memset(&verified_header, 0, sizeof verified_header);
+    memset(expected_header, 0, sizeof expected_header);
+    memset(observed_header, 0, sizeof observed_header);
+    if (store == NULL || header == NULL || master_key == NULL
+            || vault == NULL || policy == NULL || store->lock_fd < 0
+            || store->root_dir[0] != '/' || store->data_dir[0] != '/'
+            || store->torn_tail || vault_len == 0U
+            || vault_len > sizeof expected_header
+            || (journal == NULL && journal_len > 0U)
+            || journal_len > KSEC_MAX_JOURNAL_BYTES
+            || policy->staging_name == NULL || policy->retained_name == NULL
+            || (policy->require_confirmed
+                && (header->flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) == 0U)
+            || (!policy->require_confirmed
+                && (header->flags != 0U || header->generation != 1U))) {
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_header_verify_master(header, master_key);
+    if (result != KSEC_OK) goto out;
+    result = ksec_header_encode(header, expected_header,
+                                sizeof expected_header, &expected_header_len);
+    if (result != KSEC_OK) goto out;
+    if (expected_header_len != vault_len
+            || sodium_memcmp(expected_header, vault,
+                             expected_header_len) != 0) {
+        result = KSEC_ERR_CRYPTO;
+        goto out;
+    }
+    result = ksec_store_read_header(store, &old_header);
+    if (result == KSEC_OK) old_header_known = true;
+    else result = KSEC_OK;
+    if (policy->require_new_identity && old_header_known
+            && sodium_memcmp(old_header.vault_uuid, header->vault_uuid,
+                             KSEC_UUID_BYTES) == 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (create_unique_directory(store->root_dir, policy->staging_name,
+                                staging_path, sizeof staging_path,
+                                policy->directory) != 0
+            || initialize_generation_store(&staged, store->root_dir,
+                                           staging_path) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = write_generation_file(staging_path, staged.vault_path,
+                                   vault, vault_len, policy->vault);
+    if (result != KSEC_OK) goto out;
+    result = write_generation_file(staging_path, staged.journal_path,
+                                   journal, journal_len, policy->journal);
+    if (result != KSEC_OK) goto out;
+    if (initialize_generation_store(&verification, store->root_dir,
+                                    staging_path) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = ksec_store_read_header(&verification, &verified_header);
+    if (result == KSEC_OK) {
+        result = ksec_header_verify_master(&verified_header, master_key);
+    }
+    if (result == KSEC_OK) {
+        result = ksec_header_encode(&verified_header, observed_header,
+                                    sizeof observed_header,
+                                    &observed_header_len);
+    }
+    if (result == KSEC_OK && (observed_header_len != vault_len
+            || sodium_memcmp(observed_header, vault,
+                             observed_header_len) != 0)) {
+        result = KSEC_ERR_CRYPTO;
+    }
+    if (result == KSEC_OK) {
+        result = ksec_store_load(&verification, &verified_header,
+                                 master_key);
+    }
+    if (result == KSEC_OK && (verification.torn_tail
+            || (policy->require_new_identity
+                && verification.record_count != 0U))) {
+        result = KSEC_ERR_INVALID;
+    }
+    if (result != KSEC_OK
+            || complete_rotation_stage(policy->verify) != 0) {
+        if (result == KSEC_OK) result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (store_directory_sync(store->root_dir, policy->presync) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (store_exchange_directories(store->data_dir, staging_path,
+                                   policy->exchange) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    exchanged = true;
+    if (store_directory_sync(store->root_dir, policy->postsync) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    suffix = strrchr(staging_path, '.');
+    if (suffix == NULL) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (old_header_known) {
+        count = snprintf(retained_path, sizeof retained_path,
+                         "%s/.%s-%llu.%ld%s", store->root_dir,
+                         policy->retained_name,
+                         (unsigned long long)old_header.generation,
+                         (long)getpid(), suffix);
+    } else {
+        count = snprintf(retained_path, sizeof retained_path,
+                         "%s/.%s-unknown.%ld%s", store->root_dir,
+                         policy->retained_name,
+                         (long)getpid(), suffix);
+    }
+    if (count < 0 || (size_t)count >= sizeof retained_path
+            || store_rename(staging_path, retained_path, policy->retain) != 0
+            || store_directory_sync(store->root_dir, policy->retain_sync) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    clear_records(store);
+    store->last_revision = 0U;
+    store->torn_tail = false;
+    result = KSEC_OK;
+out:
+    if (exchanged && result != KSEC_OK) store->torn_tail = true;
+    clear_records(&verification);
+    verification.lock_fd = -1;
+    sodium_memzero(&staged, sizeof staged);
+    sodium_memzero(&verification, sizeof verification);
+    sodium_memzero(&old_header, sizeof old_header);
+    sodium_memzero(&verified_header, sizeof verified_header);
+    sodium_memzero(expected_header, sizeof expected_header);
+    sodium_memzero(observed_header, sizeof observed_header);
+    return result;
+}
+
+ksec_result ksec_store_import_generation(ksec_store *store,
+                                         const ksec_backup_image *image) {
+    static const generation_install_policy policy = {
+        "vault-import", "vault-previous",
+        KSEC_TEST_STORE_IMPORT_DIRECTORY,
+        KSEC_TEST_STORE_IMPORT_VAULT,
+        KSEC_TEST_STORE_IMPORT_JOURNAL,
+        KSEC_TEST_STORE_IMPORT_VERIFY,
+        KSEC_TEST_STORE_IMPORT_PRESYNC,
+        KSEC_TEST_STORE_IMPORT_EXCHANGE,
+        KSEC_TEST_STORE_IMPORT_POSTSYNC,
+        KSEC_TEST_STORE_IMPORT_RETAIN,
+        KSEC_TEST_STORE_IMPORT_RETAIN_SYNC,
+        true, false
+    };
+    if (image == NULL || image->master.data == NULL
+            || image->master.len != KSEC_MASTER_KEY_BYTES) {
+        return KSEC_ERR_INVALID;
+    }
+    return install_generation(store, &image->header, image->master.data,
+                              image->vault, image->vault_len,
+                              image->journal, image->journal_len, &policy);
+}
+
+ksec_result ksec_store_reset_generation(
+        ksec_store *store, const ksec_vault_header *new_header,
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES]) {
+    static const generation_install_policy policy = {
+        "vault-reset", "vault-reset-retained",
+        KSEC_TEST_STORE_RESET_DIRECTORY,
+        KSEC_TEST_STORE_RESET_VAULT,
+        KSEC_TEST_STORE_RESET_JOURNAL,
+        KSEC_TEST_STORE_RESET_VERIFY,
+        KSEC_TEST_STORE_RESET_PRESYNC,
+        KSEC_TEST_STORE_RESET_EXCHANGE,
+        KSEC_TEST_STORE_RESET_POSTSYNC,
+        KSEC_TEST_STORE_RESET_RETAIN,
+        KSEC_TEST_STORE_RESET_RETAIN_SYNC,
+        false, true
+    };
+    uint8_t encoded[HEADER_MAX_BYTES];
+    size_t encoded_len = 0U;
+    ksec_result result;
+    memset(encoded, 0, sizeof encoded);
+    if (new_header == NULL || new_master_key == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_header_encode(new_header, encoded, sizeof encoded,
+                                &encoded_len);
+    if (result == KSEC_OK) {
+        result = install_generation(store, new_header, new_master_key,
+                                    encoded, encoded_len, NULL, 0U, &policy);
+    }
+    sodium_memzero(encoded, sizeof encoded);
     return result;
 }

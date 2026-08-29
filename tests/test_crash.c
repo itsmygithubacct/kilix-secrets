@@ -73,18 +73,56 @@ out:
     return result;
 }
 
+static int read_file(const char *path, uint8_t **bytes, size_t *length) {
+    struct stat status;
+    int fd = -1;
+    int result = -1;
+    if (path == NULL || bytes == NULL || length == NULL) return -1;
+    *bytes = NULL;
+    *length = 0U;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)
+            || status.st_size <= 0 || (uint64_t)status.st_size > SIZE_MAX) {
+        goto out;
+    }
+    *length = (size_t)status.st_size;
+    *bytes = malloc(*length);
+    if (*bytes == NULL || ksec_read_exact(fd, *bytes, *length) != 0) goto out;
+    result = 0;
+out:
+    if (fd >= 0 && close(fd) != 0) result = -1;
+    if (result != 0 && *bytes != NULL) {
+        sodium_memzero(*bytes, *length);
+        free(*bytes);
+        *bytes = NULL;
+        *length = 0U;
+    }
+    return result;
+}
+
 static int copy_store(const char *source, const char *destination,
                       bool include_journal) {
+    char source_current[4096];
+    char destination_current[4096];
     char source_path[4096];
     char destination_path[4096];
     if (mkdir(destination, 0700) != 0
-            || make_path(source_path, sizeof source_path, source, "vault.ksv") != 0
-            || make_path(destination_path, sizeof destination_path, destination,
+            || make_path(source_current, sizeof source_current, source,
+                         "vault-current") != 0
+            || make_path(destination_current, sizeof destination_current,
+                         destination, "vault-current") != 0
+            || mkdir(destination_current, 0700) != 0
+            || make_path(source_path, sizeof source_path, source_current,
+                         "vault.ksv") != 0
+            || make_path(destination_path, sizeof destination_path,
+                         destination_current,
                          "vault.ksv") != 0
             || copy_file(source_path, destination_path) != 0) return -1;
     if (!include_journal) return 0;
-    if (make_path(source_path, sizeof source_path, source, "journal.ksj") != 0
-            || make_path(destination_path, sizeof destination_path, destination,
+    if (make_path(source_path, sizeof source_path, source_current,
+                  "journal.ksj") != 0
+            || make_path(destination_path, sizeof destination_path,
+                         destination_current,
                          "journal.ksj") != 0
             || copy_file(source_path, destination_path) != 0) return -1;
     return 0;
@@ -177,6 +215,9 @@ static int setup_header_store(const char *directory, ksec_vault_header *header,
                                     KSEC_ARGON_OPS_MIN, KSEC_ARGON_MEM_MIN,
                                     master);
     }
+    if (result == KSEC_OK) {
+        result = ksec_header_confirm_recovery(header, master);
+    }
     if (result == KSEC_OK) result = ksec_store_write_header(&store, header);
     ksec_store_close(&store);
     return result == KSEC_OK ? 0 : -1;
@@ -233,18 +274,23 @@ static void test_header_crashes(check_state *checks, const char *root,
         KSEC_TEST_STORE_HEADER_RENAME, KSEC_TEST_STORE_HEADER_DIRSYNC
     };
     static const uint8_t passphrase[] = "generated-crash-passphrase";
+    ksec_vault_header updated_template = *old_header;
     size_t index;
+    CHECK(checks, ksec_header_rewrap_slot(
+                      &updated_template, KSEC_SLOT_PASSPHRASE,
+                      passphrase, sizeof passphrase - 1U,
+                      KSEC_ARGON_OPS_MIN, KSEC_ARGON_MEM_MIN,
+                      master) == KSEC_OK,
+          "replacement header is authenticated");
     for (index = 0; index < sizeof points / sizeof points[0]; index++) {
         char directory[4096];
-        ksec_vault_header updated = *old_header;
+        ksec_vault_header updated = updated_template;
         pid_t child;
         int count = snprintf(directory, sizeof directory, "%s/header-%zu", root,
                              index);
         CHECK(checks, count > 0 && (size_t)count < sizeof directory
                       && copy_store(baseline, directory, false) == 0,
               "header crash case is staged");
-        CHECK(checks, ksec_header_confirm_recovery(&updated, master) == KSEC_OK,
-              "replacement header is authenticated");
         child = fork();
         if (child == 0) {
             ksec_store store;
@@ -380,6 +426,232 @@ static void test_compaction_crashes(check_state *checks, const char *root,
     }
 }
 
+static void test_rotation_crashes(check_state *checks, const char *root,
+                                  const char *baseline,
+                                  const ksec_vault_header *old_header,
+                                  const uint8_t old_master[32],
+                                  const uint8_t record_id[16]) {
+    static const ksec_test_store_point points[] = {
+        KSEC_TEST_STORE_ROTATE_DIRECTORY,
+        KSEC_TEST_STORE_ROTATE_HEADER,
+        KSEC_TEST_STORE_ROTATE_JOURNAL,
+        KSEC_TEST_STORE_ROTATE_VERIFY,
+        KSEC_TEST_STORE_ROTATE_PRESYNC,
+        KSEC_TEST_STORE_ROTATE_EXCHANGE,
+        KSEC_TEST_STORE_ROTATE_POSTSYNC,
+        KSEC_TEST_STORE_ROTATE_RETAIN,
+        KSEC_TEST_STORE_ROTATE_RETAIN_SYNC
+    };
+    static const uint8_t passphrase[] = "generated-crash-passphrase";
+    static const uint8_t recovery[] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    ksec_vault_header new_header = *old_header;
+    uint8_t new_master[32];
+    size_t index;
+    for (index = 0U; index < sizeof new_master; index++) {
+        new_master[index] = (uint8_t)(0xc0U + (uint8_t)index);
+    }
+    CHECK(checks, ksec_header_rotate_master(
+                      &new_header, old_master, new_master,
+                      passphrase, sizeof passphrase - 1U,
+                      recovery, sizeof recovery - 1U,
+                      KSEC_ARGON_OPS_MIN, KSEC_ARGON_MEM_MIN) == KSEC_OK,
+          "rotation crash candidate is authenticated");
+    for (index = 0U; index < sizeof points / sizeof points[0]; index++) {
+        char directory[4096];
+        pid_t child;
+        size_t recovered_count = 0U;
+        uint64_t revision = 0U;
+        bool recovered_old;
+        int count = snprintf(directory, sizeof directory, "%s/rotation-%zu",
+                             root, index);
+        CHECK(checks, count > 0 && (size_t)count < sizeof directory
+                      && copy_store(baseline, directory, true) == 0,
+              "rotation crash case is staged");
+        child = fork();
+        if (child == 0) {
+            ksec_store store;
+            ksec_vault_header loaded;
+            memset(&store, 0, sizeof store);
+            store.lock_fd = -1;
+            if (ksec_store_open(&store, directory, false) != KSEC_OK
+                    || ksec_store_read_header(&store, &loaded) != KSEC_OK
+                    || ksec_store_load(&store, &loaded, old_master) != KSEC_OK) {
+                _exit(127);
+            }
+            ksec_test_store_crash_after(points[index], 1U, 76);
+            (void)ksec_store_rotate_generation(&store, &new_header, new_master);
+            _exit(128);
+        }
+        CHECK(checks, child > 0 && child_crashed_as_expected(child, 76),
+              "rotation exits at the selected generation boundary");
+        recovered_old = recover_store(directory, old_master, &recovered_count,
+                                      &revision, NULL, record_id,
+                                      "new-value") == 0;
+        if (!recovered_old) {
+            recovered_count = 0U;
+            revision = 0U;
+        }
+        CHECK(checks, (recovered_old
+                       || recover_store(directory, new_master,
+                                        &recovered_count, &revision, NULL,
+                                        record_id, "new-value") == 0)
+                      && recovered_count == 1U && revision == 4U,
+              "rotation recovery selects one complete authenticated generation");
+    }
+    sodium_memzero(new_master, sizeof new_master);
+    sodium_memzero(&new_header, sizeof new_header);
+}
+
+static void test_import_crashes(check_state *checks, const char *root,
+                                const char *header_baseline,
+                                const char *compact_baseline,
+                                const ksec_vault_header *header,
+                                const uint8_t master[32],
+                                const uint8_t record_id[16]) {
+    static const ksec_test_store_point points[] = {
+        KSEC_TEST_STORE_IMPORT_DIRECTORY,
+        KSEC_TEST_STORE_IMPORT_VAULT,
+        KSEC_TEST_STORE_IMPORT_JOURNAL,
+        KSEC_TEST_STORE_IMPORT_VERIFY,
+        KSEC_TEST_STORE_IMPORT_PRESYNC,
+        KSEC_TEST_STORE_IMPORT_EXCHANGE,
+        KSEC_TEST_STORE_IMPORT_POSTSYNC,
+        KSEC_TEST_STORE_IMPORT_RETAIN,
+        KSEC_TEST_STORE_IMPORT_RETAIN_SYNC
+    };
+    ksec_backup_image image;
+    char source_header[4096];
+    size_t index;
+    memset(&image, 0, sizeof image);
+    CHECK(checks, make_path(source_header, sizeof source_header,
+                            header_baseline,
+                            "vault-current/vault.ksv") == 0
+                  && read_file(source_header, &image.vault,
+                               &image.vault_len) == 0
+                  && ksec_secure_alloc(&image.master,
+                                       KSEC_MASTER_KEY_BYTES) == KSEC_OK,
+          "import crash image is staged from 1/1 authenticated header");
+    image.header = *header;
+    if (image.master.data != NULL) {
+        memcpy(image.master.data, master, KSEC_MASTER_KEY_BYTES);
+    }
+    for (index = 0U; index < sizeof points / sizeof points[0]; index++) {
+        char directory[4096];
+        pid_t child;
+        size_t recovered_count = 99U;
+        uint64_t revision = UINT64_MAX;
+        int recovered;
+        int count = snprintf(directory, sizeof directory, "%s/import-%zu",
+                             root, index);
+        CHECK(checks, count > 0 && (size_t)count < sizeof directory
+                      && copy_store(compact_baseline, directory, true) == 0,
+              "import crash case is staged");
+        child = fork();
+        if (child == 0) {
+            ksec_store store;
+            memset(&store, 0, sizeof store);
+            store.lock_fd = -1;
+            if (ksec_store_open(&store, directory, false) != KSEC_OK) {
+                _exit(129);
+            }
+            ksec_test_store_crash_after(points[index], 1U, 77);
+            (void)ksec_store_import_generation(&store, &image);
+            _exit(130);
+        }
+        CHECK(checks, child > 0 && child_crashed_as_expected(child, 77),
+              "import exits at the selected generation boundary");
+        recovered = recover_store(directory, master, &recovered_count,
+                                  &revision, NULL, NULL, NULL);
+        CHECK(checks, recovered == 0
+                      && ((recovered_count == 0U && revision == 0U)
+                          || (recovered_count == 1U && revision == 4U
+                              && recover_store(directory, master, NULL, NULL,
+                                               NULL, record_id,
+                                               "new-value") == 0)),
+              "import recovery selects one complete authenticated generation");
+    }
+    ksec_backup_image_clear(&image);
+}
+
+static void test_reset_crashes(check_state *checks, const char *root,
+                               const char *compact_baseline,
+                               const ksec_vault_header *old_header,
+                               const uint8_t old_master[32],
+                               const uint8_t record_id[16]) {
+    static const ksec_test_store_point points[] = {
+        KSEC_TEST_STORE_RESET_DIRECTORY,
+        KSEC_TEST_STORE_RESET_VAULT,
+        KSEC_TEST_STORE_RESET_JOURNAL,
+        KSEC_TEST_STORE_RESET_VERIFY,
+        KSEC_TEST_STORE_RESET_PRESYNC,
+        KSEC_TEST_STORE_RESET_EXCHANGE,
+        KSEC_TEST_STORE_RESET_POSTSYNC,
+        KSEC_TEST_STORE_RESET_RETAIN,
+        KSEC_TEST_STORE_RESET_RETAIN_SYNC
+    };
+    static const uint8_t passphrase[] = "generated-reset-passphrase";
+    static const uint8_t recovery[] =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    ksec_vault_header new_header;
+    uint8_t new_master[32];
+    size_t index;
+    memset(&new_header, 0, sizeof new_header);
+    memset(new_master, 0, sizeof new_master);
+    CHECK(checks, ksec_header_create(
+                      &new_header, passphrase, sizeof passphrase - 1U,
+                      recovery, sizeof recovery - 1U,
+                      KSEC_ARGON_OPS_MIN, KSEC_ARGON_MEM_MIN,
+                      new_master) == KSEC_OK
+                  && sodium_memcmp(new_header.vault_uuid,
+                                   old_header->vault_uuid,
+                                   KSEC_UUID_BYTES) != 0,
+          "reset crash candidate has one distinct authenticated vault identity");
+    for (index = 0U; index < sizeof points / sizeof points[0]; index++) {
+        char directory[4096];
+        pid_t child;
+        size_t recovered_count = 99U;
+        uint64_t revision = UINT64_MAX;
+        bool recovered_old;
+        int count = snprintf(directory, sizeof directory, "%s/reset-%zu",
+                             root, index);
+        CHECK(checks, count > 0 && (size_t)count < sizeof directory
+                      && copy_store(compact_baseline, directory, true) == 0,
+              "reset crash case is staged");
+        child = fork();
+        if (child == 0) {
+            ksec_store store;
+            memset(&store, 0, sizeof store);
+            store.lock_fd = -1;
+            if (ksec_store_open(&store, directory, false) != KSEC_OK) {
+                _exit(131);
+            }
+            ksec_test_store_crash_after(points[index], 1U, 78);
+            (void)ksec_store_reset_generation(&store, &new_header,
+                                              new_master);
+            _exit(132);
+        }
+        CHECK(checks, child > 0 && child_crashed_as_expected(child, 78),
+              "reset exits at the selected generation boundary");
+        recovered_old = recover_store(directory, old_master,
+                                      &recovered_count, &revision, NULL,
+                                      record_id, "new-value") == 0;
+        if (!recovered_old) {
+            recovered_count = 99U;
+            revision = UINT64_MAX;
+        }
+        CHECK(checks, (recovered_old
+                       && recovered_count == 1U && revision == 4U)
+                      || (recover_store(directory, new_master,
+                                        &recovered_count, &revision, NULL,
+                                        NULL, NULL) == 0
+                          && recovered_count == 0U && revision == 0U),
+              "reset recovery selects one old-or-new complete identity");
+    }
+    sodium_memzero(new_master, sizeof new_master);
+    sodium_memzero(&new_header, sizeof new_header);
+}
+
 static void test_storage_failures(check_state *checks, const char *root,
                                   const char *header_baseline,
                                   const char *compact_baseline,
@@ -388,6 +660,7 @@ static void test_storage_failures(check_state *checks, const char *root,
                                   const uint8_t first_id[16],
                                   const uint8_t append_id[16]) {
     char directory[4096];
+    char current[4096];
     char path[4096];
     ksec_store store;
     ksec_owned_record record;
@@ -459,7 +732,9 @@ static void test_storage_failures(check_state *checks, const char *root,
     count = snprintf(directory, sizeof directory, "%s/stale-temp", root);
     CHECK(checks, count > 0 && (size_t)count < sizeof directory
                   && copy_store(compact_baseline, directory, true) == 0
-                  && make_path(path, sizeof path, directory,
+                  && make_path(current, sizeof current, directory,
+                               "vault-current") == 0
+                  && make_path(path, sizeof path, current,
                                ".journal.ksj.tmp.stale") == 0,
           "stale temporary case is staged");
     {
@@ -498,7 +773,9 @@ static void test_storage_failures(check_state *checks, const char *root,
     count = snprintf(directory, sizeof directory, "%s/read-only", root);
     CHECK(checks, count > 0 && (size_t)count < sizeof directory
                   && copy_store(compact_baseline, directory, true) == 0
-                  && make_path(path, sizeof path, directory, "journal.ksj") == 0
+                  && make_path(current, sizeof current, directory,
+                               "vault-current") == 0
+                  && make_path(path, sizeof path, current, "journal.ksj") == 0
                   && chmod(path, 0400) == 0,
           "read-only journal case is staged");
     memset(&store, 0, sizeof store);
@@ -560,6 +837,12 @@ int main(void) {
                         append_id);
     test_compaction_crashes(&checks, root, compact_baseline, &header, master,
                             first_id);
+    test_rotation_crashes(&checks, root, compact_baseline, &header, master,
+                          first_id);
+    test_import_crashes(&checks, root, header_baseline, compact_baseline,
+                        &header, master, first_id);
+    test_reset_crashes(&checks, root, compact_baseline, &header, master,
+                       first_id);
     test_storage_failures(&checks, root, header_baseline, compact_baseline,
                           &header, master, first_id, append_id);
 

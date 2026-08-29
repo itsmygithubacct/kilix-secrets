@@ -3,9 +3,12 @@
 #include "internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 enum { MAX_VECTOR_ENTRIES = 64, MAX_VECTOR_KEY = 64, MAX_VECTOR_VALUE = 4096 };
 
@@ -103,6 +106,10 @@ static int vector_hex(const vector_file *vectors, const char *key,
 int main(void) {
     static const char header_context[8] = {'K','S','V','H','D','R','0','1'};
     static const char record_context[8] = {'K','S','V','R','E','C','0','1'};
+    static const char backup_context[8] = {'K','S','B','A','C','K','0','1'};
+    static const uint8_t backup_slot_domain[8] = {
+        'K','S','B','K','S','L','0','1'
+    };
     vector_file vectors;
     ksec_vault_header header;
     ksec_vault_header mutated_header;
@@ -125,6 +132,11 @@ int main(void) {
     size_t actual_ad_length = 0U;
     uint8_t object_id[16];
     size_t object_id_length = 0U;
+    uint8_t identity_public[KSEC_IDENTITY_KEY_BYTES];
+    size_t identity_public_length = 0U;
+    uint8_t expected_identity_anchor[KSEC_IDENTITY_ANCHOR_BYTES];
+    size_t expected_identity_anchor_length = 0U;
+    uint8_t actual_identity_anchor[KSEC_IDENTITY_ANCHOR_BYTES];
     uint8_t plaintext[1024];
     size_t plaintext_length = 0U;
     uint8_t nonce[24];
@@ -140,11 +152,26 @@ int main(void) {
     uint8_t altered_uuid[16];
     uint8_t altered_id[16];
     uint8_t altered_nonce[24];
+    uint8_t backup_passphrase[128];
+    size_t backup_passphrase_length = 0U;
+    uint8_t backup_header[176];
+    size_t backup_header_length = 0U;
+    uint8_t backup_ciphertext[1024];
+    size_t backup_ciphertext_length = 0U;
+    uint8_t backup_bytes[1200];
+    size_t backup_bytes_length = 0U;
+    uint8_t backup_slot_ad[84];
+    uint8_t backup_master[32];
+    unsigned long long backup_master_length = 0U;
+    uint8_t backup_plaintext[1024];
+    unsigned long long backup_plaintext_length = 0U;
+    ksec_backup_image backup_image;
+    int backup_fd = -1;
     size_t index;
 
     CHECK(ksec_crypto_initialize() == KSEC_OK);
     CHECK(load_vectors(&vectors) == 0);
-    CHECK(vectors.count == 37U);
+    CHECK(vectors.count == 50U);
     CHECK(strcmp(vector_get(&vectors, "vector_format"), "KSEC-FULL-V1") == 0);
     CHECK(strcmp(vector_get(&vectors, "provider"),
                  "libsodium-1.0.18-1+deb13u1") == 0);
@@ -253,6 +280,27 @@ int main(void) {
     CHECK(vector_hex(&vectors, "object_id", object_id, sizeof object_id,
                      &object_id_length) == 0
           && object_id_length == sizeof object_id);
+    CHECK(vector_hex(&vectors, "identity_public_key", identity_public,
+                     sizeof identity_public, &identity_public_length) == 0
+          && identity_public_length == sizeof identity_public
+          && crypto_scalarmult_curve25519_base(derived_key, master) == 0
+          && sodium_memcmp(derived_key, identity_public,
+                           sizeof identity_public) == 0);
+    CHECK(vector_hex(&vectors, "identity_anchor", expected_identity_anchor,
+                     sizeof expected_identity_anchor,
+                     &expected_identity_anchor_length) == 0
+          && expected_identity_anchor_length
+                == sizeof expected_identity_anchor
+          && ksec_identity_anchor(header.vault_uuid, object_id, 7U,
+                                  identity_public,
+                                  actual_identity_anchor) == KSEC_OK
+          && sodium_memcmp(actual_identity_anchor, expected_identity_anchor,
+                           sizeof actual_identity_anchor) == 0);
+    CHECK(ksec_identity_anchor(header.vault_uuid, object_id, 8U,
+                               identity_public,
+                               actual_identity_anchor) == KSEC_OK
+          && sodium_memcmp(actual_identity_anchor, expected_identity_anchor,
+                           sizeof actual_identity_anchor) != 0);
     CHECK(vector_hex(&vectors, "record_plaintext", plaintext,
                      sizeof plaintext, &plaintext_length) == 0);
     CHECK(vector_hex(&vectors, "record_ad", expected_ad, sizeof expected_ad,
@@ -352,6 +400,97 @@ int main(void) {
                               sizeof decrypted, &decrypted_length)
           == KSEC_ERR_CRYPTO);
 
+    CHECK(vector_hex(&vectors, "backup_passphrase", backup_passphrase,
+                     sizeof backup_passphrase,
+                     &backup_passphrase_length) == 0);
+    CHECK(vector_hex(&vectors, "backup_header", backup_header,
+                     sizeof backup_header, &backup_header_length) == 0
+          && backup_header_length == sizeof backup_header);
+    CHECK(vector_hex(&vectors, "backup_ciphertext", backup_ciphertext,
+                     sizeof backup_ciphertext,
+                     &backup_ciphertext_length) == 0
+          && backup_ciphertext_length == header_length + KSEC_TAG_BYTES);
+    CHECK(vector_hex(&vectors, "backup_bytes", backup_bytes,
+                     sizeof backup_bytes, &backup_bytes_length) == 0
+          && backup_bytes_length == backup_header_length
+                                   + backup_ciphertext_length
+          && sodium_memcmp(backup_bytes, backup_header,
+                           backup_header_length) == 0
+          && sodium_memcmp(backup_bytes + backup_header_length,
+                           backup_ciphertext,
+                           backup_ciphertext_length) == 0);
+    memcpy(backup_slot_ad, backup_slot_domain, sizeof backup_slot_domain);
+    memcpy(backup_slot_ad + 8U, backup_header + 8U, 36U);
+    memcpy(backup_slot_ad + 44U, backup_header + 116U, 36U);
+    ksec_put_u32(backup_slot_ad + 80U, KSEC_MASTER_KEY_BYTES);
+    CHECK(vector_hex(&vectors, "backup_slot_ad", expected_ad,
+                     sizeof expected_ad, &expected_ad_length) == 0
+          && expected_ad_length == sizeof backup_slot_ad
+          && sodium_memcmp(expected_ad, backup_slot_ad,
+                           sizeof backup_slot_ad) == 0);
+    CHECK(vector_hex(&vectors, "backup_wrapping_key", expected_key,
+                     sizeof expected_key, &expected_key_length) == 0
+          && crypto_pwhash(
+              derived_key, sizeof derived_key,
+              (const char *)backup_passphrase,
+              (unsigned long long)backup_passphrase_length,
+              backup_header + 28U,
+              (unsigned long long)ksec_get_u32(backup_header + 16U),
+              (size_t)ksec_get_u64(backup_header + 20U),
+              crypto_pwhash_ALG_ARGON2ID13) == 0
+          && sodium_memcmp(derived_key, expected_key,
+                           sizeof derived_key) == 0);
+    CHECK(crypto_aead_xchacha20poly1305_ietf_decrypt(
+              backup_master, &backup_master_length, NULL,
+              backup_header + 68U, KSEC_SLOT_CIPHERTEXT_BYTES,
+              backup_slot_ad, sizeof backup_slot_ad,
+              backup_header + 44U, derived_key) == 0
+          && backup_master_length == sizeof backup_master
+          && sodium_memcmp(backup_master, master, sizeof master) == 0);
+    CHECK(vector_hex(&vectors, "backup_payload_key", expected_key,
+                     sizeof expected_key, &expected_key_length) == 0
+          && crypto_kdf_derive_from_key(derived_key, sizeof derived_key, 1U,
+                                        backup_context, master) == 0
+          && sodium_memcmp(derived_key, expected_key,
+                           sizeof derived_key) == 0);
+    CHECK(crypto_aead_xchacha20poly1305_ietf_decrypt(
+              backup_plaintext, &backup_plaintext_length, NULL,
+              backup_ciphertext,
+              (unsigned long long)backup_ciphertext_length,
+              backup_header, sizeof backup_header, backup_header + 152U,
+              derived_key) == 0
+          && backup_plaintext_length == header_length
+          && sodium_memcmp(backup_plaintext, header_bytes,
+                           header_length) == 0);
+    memset(&backup_image, 0, sizeof backup_image);
+    backup_fd = memfd_create("ksec-vector-backup", MFD_CLOEXEC);
+    CHECK(backup_fd >= 0
+          && ksec_write_all(backup_fd, backup_bytes, backup_bytes_length) == 0
+          && lseek(backup_fd, 0, SEEK_SET) == 0
+          && ksec_backup_open(backup_fd, backup_passphrase,
+                              backup_passphrase_length,
+                              &backup_image) == KSEC_OK
+          && backup_image.vault_len == header_length
+          && backup_image.journal_len == 0U
+          && sodium_memcmp(backup_image.vault, header_bytes,
+                           header_length) == 0
+          && sodium_memcmp(backup_image.master.data, master,
+                           sizeof master) == 0);
+    if (backup_fd >= 0) CHECK(close(backup_fd) == 0);
+    backup_fd = -1;
+    ksec_backup_image_clear(&backup_image);
+    backup_bytes[backup_bytes_length - 1U] ^= 1U;
+    backup_fd = memfd_create("ksec-vector-backup-corrupt", MFD_CLOEXEC);
+    CHECK(backup_fd >= 0
+          && ksec_write_all(backup_fd, backup_bytes, backup_bytes_length) == 0
+          && lseek(backup_fd, 0, SEEK_SET) == 0
+          && ksec_backup_open(backup_fd, backup_passphrase,
+                              backup_passphrase_length,
+                              &backup_image) == KSEC_ERR_CRYPTO);
+    if (backup_fd >= 0) CHECK(close(backup_fd) == 0);
+    backup_fd = -1;
+    ksec_backup_image_clear(&backup_image);
+
     sodium_memzero(&vectors, sizeof vectors);
     sodium_memzero(&header, sizeof header);
     sodium_memzero(&mutated_header, sizeof mutated_header);
@@ -363,11 +502,22 @@ int main(void) {
     sodium_memzero(derived_key, sizeof derived_key);
     sodium_memzero(expected_ad, sizeof expected_ad);
     sodium_memzero(actual_ad, sizeof actual_ad);
+    sodium_memzero(identity_public, sizeof identity_public);
+    sodium_memzero(expected_identity_anchor,
+                   sizeof expected_identity_anchor);
+    sodium_memzero(actual_identity_anchor, sizeof actual_identity_anchor);
     sodium_memzero(plaintext, sizeof plaintext);
     sodium_memzero(ciphertext, sizeof ciphertext);
     sodium_memzero(encrypted, sizeof encrypted);
     sodium_memzero(decrypted, sizeof decrypted);
     sodium_memzero(mutation, sizeof mutation);
+    sodium_memzero(backup_passphrase, sizeof backup_passphrase);
+    sodium_memzero(backup_header, sizeof backup_header);
+    sodium_memzero(backup_ciphertext, sizeof backup_ciphertext);
+    sodium_memzero(backup_bytes, sizeof backup_bytes);
+    sodium_memzero(backup_slot_ad, sizeof backup_slot_ad);
+    sodium_memzero(backup_master, sizeof backup_master);
+    sodium_memzero(backup_plaintext, sizeof backup_plaintext);
     printf("full-vector checks: %u/%u passed\n",
            checks_run - checks_failed, checks_run);
     return checks_failed == 0U ? 0 : 1;

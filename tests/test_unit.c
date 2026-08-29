@@ -95,6 +95,8 @@ static void test_utilities(void) {
     CHECK(ksec_validate_text_bytes(embedded_nul, sizeof embedded_nul, 8U) != 0);
     CHECK(ksec_process_start_time(getpid(), &start_time) == 0 && start_time != 0U);
     CHECK(strcmp(ksec_result_string(KSEC_ERR_CRYPTO), "authentication failure") == 0);
+    CHECK(strcmp(ksec_result_string(KSEC_ERR_CONFLICT),
+                 "identity generation conflict") == 0);
     CHECK(strcmp(ksec_result_string((ksec_result)99), "unknown result") == 0);
 }
 
@@ -226,7 +228,7 @@ static void test_record_codec(void) {
     };
     ksec_record input = {
         "kilix-secrets.test", "opaque", "Synthetic café", 1234U,
-        fields, 2U
+        fields, 2U, NULL, 0U
     };
     uint8_t encoded[1024];
     size_t encoded_len = 0;
@@ -234,6 +236,14 @@ static void test_record_codec(void) {
     ksec_field duplicates[2] = {
         {"same", first_value, sizeof first_value},
         {"same", second_value, sizeof second_value}
+    };
+    ksec_grant grants[2] = {
+        {"consumer.alpha", KSEC_VERB_READ | KSEC_VERB_USE},
+        {"consumer.beta", KSEC_VERB_LIST_OWN}
+    };
+    ksec_grant unsorted_grants[2] = {
+        {"consumer.beta", KSEC_VERB_READ},
+        {"consumer.alpha", KSEC_VERB_READ}
     };
     memset(&parsed, 0, sizeof parsed);
     CHECK(ksec_record_serialize(&input, encoded, sizeof encoded,
@@ -271,6 +281,34 @@ static void test_record_codec(void) {
     encoded[encoded_len] = 0U;
     CHECK(ksec_record_parse(encoded, encoded_len + 1U, &parsed) == KSEC_ERR_INVALID);
     CHECK(ksec_record_parse(encoded, 25U, &parsed) == KSEC_ERR_INVALID);
+
+    input.grants = grants;
+    input.grant_count = 2U;
+    CHECK(ksec_record_serialize(&input, encoded, sizeof encoded,
+                                &encoded_len) == KSEC_OK);
+    CHECK(encoded[10] == 0U && encoded[11] == 1U);
+    CHECK(ksec_record_parse(encoded, encoded_len, &parsed) == KSEC_OK);
+    CHECK(parsed.grant_count == 2U);
+    CHECK(strcmp(parsed.grants[0].application_id, "consumer.alpha") == 0);
+    CHECK(parsed.grants[0].verbs == (KSEC_VERB_READ | KSEC_VERB_USE));
+    CHECK(strcmp(parsed.grants[1].application_id, "consumer.beta") == 0);
+    CHECK(parsed.grants[1].verbs == KSEC_VERB_LIST_OWN);
+    ksec_owned_record_clear(&parsed);
+    input.grants = unsorted_grants;
+    CHECK(ksec_record_serialize(&input, encoded, sizeof encoded,
+                                &encoded_len) == KSEC_ERR_INVALID);
+    input.grants = grants;
+    grants[0].verbs = KSEC_VERB_CREATE;
+    CHECK(ksec_record_serialize(&input, encoded, sizeof encoded,
+                                &encoded_len) == KSEC_ERR_INVALID);
+    grants[0].verbs = KSEC_VERB_READ | KSEC_VERB_USE;
+    CHECK(ksec_record_serialize(&input, encoded, sizeof encoded,
+                                &encoded_len) == KSEC_OK);
+    encoded[26] = 0U;
+    encoded[27] = 0U;
+    CHECK(ksec_record_parse(encoded, encoded_len, &parsed) == KSEC_ERR_INVALID);
+    input.grants = NULL;
+    input.grant_count = 0U;
 }
 
 static void send_two_fds(int socket_fd, const uint8_t *packet,
@@ -320,6 +358,16 @@ static void test_protocol(void) {
                              &parsed_payload) == KSEC_OK);
     CHECK(parsed.operation == header.operation && parsed.request_id == header.request_id);
     CHECK(memcmp(parsed_payload, payload, sizeof payload) == 0);
+    header.operation = KSEC_OP_IDENTITY_OPEN;
+    CHECK(ksec_packet_encode(&header, payload, packet, sizeof packet,
+                             &packet_len) == KSEC_OK
+          && ksec_packet_decode(packet, packet_len, &parsed,
+                                &parsed_payload) == KSEC_OK
+          && parsed.operation == KSEC_OP_IDENTITY_OPEN);
+    header.operation = (uint16_t)(KSEC_OP_MAX + 1U);
+    CHECK(ksec_packet_encode(&header, payload, packet, sizeof packet,
+                             &packet_len) == KSEC_ERR_INVALID);
+    header.operation = KSEC_OP_GET;
     CHECK(ksec_packet_decode(packet, packet_len - 1U, &parsed,
                              &parsed_payload) == KSEC_ERR_PROTOCOL);
     packet[packet_len] = 0U;
@@ -577,14 +625,25 @@ static int make_temp_dir(char path[4096]) {
 
 static void cleanup_store_dir(const char *path) {
     static const char *const leaves[] = {
-        "vault.ksv", "journal.ksj", "writer.lock", "audit.log", "audit.log.1",
-        ".vault.ksv.tmp", ".journal.ksj.tmp", "vault-link"
+        "writer.lock", "audit.log", "audit.log.1", "vault-link"
     };
     size_t index;
     char child[4096];
     for (index = 0; index < sizeof leaves / sizeof leaves[0]; index++) {
         int count = snprintf(child, sizeof child, "%s/%s", path, leaves[index]);
         if (count >= 0 && (size_t)count < sizeof child) (void)unlink(child);
+    }
+    {
+        static const char *const vault_leaves[] = {"vault.ksv", "journal.ksj"};
+        for (index = 0; index < sizeof vault_leaves / sizeof vault_leaves[0]; index++) {
+            int count = snprintf(child, sizeof child, "%s/vault-current/%s", path,
+                                 vault_leaves[index]);
+            if (count >= 0 && (size_t)count < sizeof child) (void)unlink(child);
+        }
+        {
+            int count = snprintf(child, sizeof child, "%s/vault-current", path);
+            if (count >= 0 && (size_t)count < sizeof child) (void)rmdir(child);
+        }
     }
     (void)rmdir(path);
 }
@@ -594,7 +653,9 @@ static ksec_result make_owned_record(ksec_owned_record *owned,
                                      const uint8_t *value, size_t value_len,
                                      const char *label) {
     ksec_field field = {"value", value, value_len};
-    ksec_record record = {"kilix-secrets.test", "opaque", label, 0U, &field, 1U};
+    ksec_record record = {
+        "kilix-secrets.test", "opaque", label, 0U, &field, 1U, NULL, 0U
+    };
     uint8_t encoded[1024];
     size_t encoded_len = 0;
     ksec_result result = ksec_record_serialize(&record, encoded, sizeof encoded,
@@ -664,7 +725,8 @@ static void test_store(void) {
           && ksec_store_find(&store, id)->revision == 4U);
     ksec_store_close(&store);
 
-    CHECK(snprintf(journal_path, sizeof journal_path, "%s/journal.ksj", directory) > 0);
+    CHECK(snprintf(journal_path, sizeof journal_path,
+                   "%s/vault-current/journal.ksj", directory) > 0);
     fd = open(journal_path, O_WRONLY | O_APPEND | O_CLOEXEC);
     CHECK(fd >= 0);
     if (fd >= 0) {
@@ -680,7 +742,8 @@ static void test_store(void) {
     ksec_owned_record_clear(&record);
     ksec_store_close(&store);
 
-    CHECK(snprintf(vault_path, sizeof vault_path, "%s/vault.ksv", directory) > 0);
+    CHECK(snprintf(vault_path, sizeof vault_path,
+                   "%s/vault-current/vault.ksv", directory) > 0);
     CHECK(snprintf(link_path, sizeof link_path, "%s/vault-link", directory) > 0);
     CHECK(link(vault_path, link_path) == 0);
     CHECK(ksec_store_open(&store, directory, false) == KSEC_OK);
