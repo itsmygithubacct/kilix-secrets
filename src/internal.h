@@ -145,7 +145,9 @@ typedef enum {
     KSEC_OP_DELETE = 9,
     KSEC_OP_LIST = 10,
     KSEC_OP_DOCTOR = 11,
-    KSEC_OP_COMPACT = 12
+    KSEC_OP_COMPACT = 12,
+    KSEC_OP_CHANGE_PASSPHRASE = 13,
+    KSEC_OP_MAX = KSEC_OP_CHANGE_PASSPHRASE
 } ksec_operation;
 
 typedef struct {
@@ -182,8 +184,34 @@ int ksec_hex_decode(const char *input, uint8_t *output, size_t output_length);
 
 ksec_result ksec_secure_alloc(ksec_secure_buffer *buffer, size_t length);
 void ksec_secure_free(ksec_secure_buffer *buffer);
+typedef enum {
+    KSEC_TEST_STORE_HEADER_OPEN = 1,
+    KSEC_TEST_STORE_HEADER_WRITE = 2,
+    KSEC_TEST_STORE_HEADER_FSYNC = 3,
+    KSEC_TEST_STORE_HEADER_CLOSE = 4,
+    KSEC_TEST_STORE_HEADER_RENAME = 5,
+    KSEC_TEST_STORE_HEADER_DIRSYNC = 6,
+    KSEC_TEST_STORE_APPEND_OPEN = 7,
+    KSEC_TEST_STORE_APPEND_WRITE = 8,
+    KSEC_TEST_STORE_APPEND_FSYNC = 9,
+    KSEC_TEST_STORE_APPEND_CLOSE = 10,
+    KSEC_TEST_STORE_APPEND_DIRSYNC = 11,
+    KSEC_TEST_STORE_COMPACT_OPEN = 12,
+    KSEC_TEST_STORE_COMPACT_WRITE = 13,
+    KSEC_TEST_STORE_COMPACT_FSYNC = 14,
+    KSEC_TEST_STORE_COMPACT_CLOSE = 15,
+    KSEC_TEST_STORE_COMPACT_RENAME = 16,
+    KSEC_TEST_STORE_COMPACT_DIRSYNC = 17
+} ksec_test_store_point;
+
 #ifdef KSEC_TESTING
 void ksec_test_force_mlock_failure(bool enabled);
+void ksec_test_store_fault_reset(void);
+void ksec_test_store_crash_after(ksec_test_store_point point,
+                                 unsigned int occurrence, int exit_status);
+void ksec_test_store_fail_at(ksec_test_store_point point,
+                             unsigned int occurrence, int error_number,
+                             size_t partial_write_bytes);
 #endif
 
 ksec_result ksec_format_record_ad(uint16_t object_type,
@@ -215,6 +243,18 @@ ksec_result ksec_header_unlock(const ksec_vault_header *header,
 ksec_result ksec_header_confirm_recovery(
         ksec_vault_header *header,
         const uint8_t master_key[KSEC_MASTER_KEY_BYTES]);
+ksec_result ksec_header_rewrap_slot(
+        ksec_vault_header *header, ksec_slot_type slot_type,
+        const uint8_t *new_secret, size_t new_secret_len,
+        uint32_t opslimit, uint64_t memlimit,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES]);
+ksec_result ksec_header_rotate_master(
+        ksec_vault_header *header,
+        const uint8_t old_master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t *passphrase, size_t passphrase_len,
+        const uint8_t *recovery, size_t recovery_len,
+        uint32_t opslimit, uint64_t memlimit);
 ksec_result ksec_header_encode(const ksec_vault_header *header, uint8_t *output,
                                size_t output_size, size_t *output_length);
 ksec_result ksec_header_decode(const uint8_t *input, size_t input_length,

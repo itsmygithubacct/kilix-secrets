@@ -21,6 +21,118 @@ enum {
 
 static const uint8_t JOURNAL_MAGIC[8] = {'K','S','V','J','R','0','0','1'};
 
+#ifdef KSEC_TESTING
+typedef struct {
+    bool active;
+    ksec_test_store_point point;
+    unsigned int occurrence;
+    unsigned int seen;
+    int value;
+    size_t partial_write_bytes;
+} store_test_fault;
+
+static store_test_fault crash_fault;
+static store_test_fault error_fault;
+
+void ksec_test_store_fault_reset(void) {
+    memset(&crash_fault, 0, sizeof crash_fault);
+    memset(&error_fault, 0, sizeof error_fault);
+}
+
+void ksec_test_store_crash_after(ksec_test_store_point point,
+                                 unsigned int occurrence, int exit_status) {
+    memset(&crash_fault, 0, sizeof crash_fault);
+    crash_fault.active = true;
+    crash_fault.point = point;
+    crash_fault.occurrence = occurrence;
+    crash_fault.value = exit_status;
+}
+
+void ksec_test_store_fail_at(ksec_test_store_point point,
+                             unsigned int occurrence, int error_number,
+                             size_t partial_write_bytes) {
+    memset(&error_fault, 0, sizeof error_fault);
+    error_fault.active = true;
+    error_fault.point = point;
+    error_fault.occurrence = occurrence;
+    error_fault.value = error_number;
+    error_fault.partial_write_bytes = partial_write_bytes;
+}
+
+static bool test_fault_matches(store_test_fault *fault,
+                               ksec_test_store_point point) {
+    if (!fault->active || fault->point != point) return false;
+    fault->seen++;
+    if (fault->seen != fault->occurrence) return false;
+    fault->active = false;
+    return true;
+}
+
+static int store_test_before(ksec_test_store_point point, int fd,
+                             const void *data, size_t length) {
+    if (!test_fault_matches(&error_fault, point)) return 0;
+    if (error_fault.partial_write_bytes > 0U && fd >= 0 && data != NULL
+            && length > 0U) {
+        size_t partial = error_fault.partial_write_bytes;
+        if (partial > length) partial = length;
+        if (ksec_write_all(fd, data, partial) != 0) return -1;
+    }
+    errno = error_fault.value;
+    return -1;
+}
+
+static void store_test_after(ksec_test_store_point point) {
+    if (test_fault_matches(&crash_fault, point)) {
+        _exit(crash_fault.value);
+    }
+}
+#else
+static int store_test_before(int point, int fd, const void *data, size_t length) {
+    (void)point;
+    (void)fd;
+    (void)data;
+    (void)length;
+    return 0;
+}
+
+static void store_test_after(int point) {
+    (void)point;
+}
+#endif
+
+static int store_write_all(int fd, const void *data, size_t length, int point) {
+    if (store_test_before(point, fd, data, length) != 0
+            || ksec_write_all(fd, data, length) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
+static int store_fsync(int fd, int point) {
+    if (store_test_before(point, fd, NULL, 0U) != 0 || fsync(fd) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
+static int store_close(int fd, int point) {
+    if (store_test_before(point, fd, NULL, 0U) != 0 || close(fd) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
+static int store_rename(const char *old_path, const char *new_path, int point) {
+    if (store_test_before(point, -1, NULL, 0U) != 0
+            || rename(old_path, new_path) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
+static int store_directory_sync(const char *path, int point) {
+    if (store_test_before(point, -1, NULL, 0U) != 0
+            || ksec_sync_directory(path) != 0) return -1;
+    store_test_after(point);
+    return 0;
+}
+
 static int safe_regular_fd(int fd, mode_t required_mode) {
     struct stat status;
     if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)
@@ -33,6 +145,37 @@ static int make_path(char *output, size_t output_size, const char *directory,
                      const char *leaf) {
     int count = snprintf(output, output_size, "%s/%s", directory, leaf);
     return count < 0 || (size_t)count >= output_size ? -1 : 0;
+}
+
+static int open_unique_temporary(const char *directory, const char *stem,
+                                 char *path, size_t path_size, int point) {
+    unsigned int attempt;
+    if (store_test_before(point, -1, NULL, 0U) != 0) return -1;
+    for (attempt = 0U; attempt < 32U; attempt++) {
+        uint8_t suffix[8];
+        char suffix_hex[17];
+        int count;
+        int fd;
+        randombytes_buf(suffix, sizeof suffix);
+        ksec_hex_encode(suffix, sizeof suffix, suffix_hex);
+        sodium_memzero(suffix, sizeof suffix);
+        count = snprintf(path, path_size, "%s/.%s.tmp.%ld.%s", directory,
+                         stem, (long)getpid(), suffix_hex);
+        sodium_memzero(suffix_hex, sizeof suffix_hex);
+        if (count < 0 || (size_t)count >= path_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+        if (fd >= 0) {
+            store_test_after(point);
+            return fd;
+        }
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
 }
 
 static int sync_parent_directory(const char *path) {
@@ -270,18 +413,20 @@ ksec_result ksec_store_write_header(ksec_store *store,
     size_t encoded_len = 0;
     char temporary[4096];
     int fd = -1;
-    int count;
     ksec_result result;
     if (store == NULL || header == NULL) return KSEC_ERR_INVALID;
     result = ksec_header_encode(header, encoded, sizeof encoded, &encoded_len);
     if (result != KSEC_OK) return result;
-    count = snprintf(temporary, sizeof temporary, "%s/.vault.ksv.tmp.%ld",
-                     store->data_dir, (long)getpid());
-    if (count < 0 || (size_t)count >= sizeof temporary) return KSEC_ERR_LIMIT;
-    fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) return KSEC_ERR_IO;
-    if (safe_regular_fd(fd, 0600) != 0 || ksec_write_all(fd, encoded, encoded_len) != 0
-            || fsync(fd) != 0) {
+    fd = open_unique_temporary(store->data_dir, "vault.ksv", temporary,
+                               sizeof temporary, KSEC_TEST_STORE_HEADER_OPEN);
+    if (fd < 0) {
+        sodium_memzero(encoded, sizeof encoded);
+        return KSEC_ERR_IO;
+    }
+    if (safe_regular_fd(fd, 0600) != 0
+            || store_write_all(fd, encoded, encoded_len,
+                               KSEC_TEST_STORE_HEADER_WRITE) != 0
+            || store_fsync(fd, KSEC_TEST_STORE_HEADER_FSYNC) != 0) {
         int saved = errno;
         (void)close(fd);
         (void)unlink(temporary);
@@ -289,7 +434,7 @@ ksec_result ksec_store_write_header(ksec_store *store,
         errno = saved;
         return KSEC_ERR_IO;
     }
-    if (close(fd) != 0) {
+    if (store_close(fd, KSEC_TEST_STORE_HEADER_CLOSE) != 0) {
         int saved = errno;
         fd = -1;
         (void)unlink(temporary);
@@ -298,8 +443,10 @@ ksec_result ksec_store_write_header(ksec_store *store,
         return KSEC_ERR_IO;
     }
     fd = -1;
-    if (rename(temporary, store->vault_path) != 0
-            || ksec_sync_directory(store->data_dir) != 0) {
+    if (store_rename(temporary, store->vault_path,
+                     KSEC_TEST_STORE_HEADER_RENAME) != 0
+            || store_directory_sync(store->data_dir,
+                                    KSEC_TEST_STORE_HEADER_DIRSYNC) != 0) {
         int saved = errno;
         (void)unlink(temporary);
         sodium_memzero(encoded, sizeof encoded);
@@ -499,6 +646,7 @@ ksec_result ksec_store_append(ksec_store *store,
     uint8_t *entry = NULL;
     size_t entry_len = 0;
     bool created = false;
+    bool write_attempted = false;
     int fd;
     ksec_result result;
     if (store == NULL || header == NULL || master_key == NULL || record == NULL
@@ -507,15 +655,21 @@ ksec_result ksec_store_append(ksec_store *store,
     if (record->revision == 0) return KSEC_ERR_LIMIT;
     result = make_entry(header, master_key, record, deletion, &entry, &entry_len);
     if (result != KSEC_OK) return result;
-    fd = open(store->journal_path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0 && errno == ENOENT) {
+    if (store_test_before(KSEC_TEST_STORE_APPEND_OPEN, -1, NULL, 0U) != 0) {
+        fd = -1;
+    } else {
         fd = open(store->journal_path,
-                  O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                  0600);
-        created = fd >= 0;
+                  O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 && errno == ENOENT) {
+            fd = open(store->journal_path,
+                      O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC
+                          | O_NOFOLLOW,
+                      0600);
+            created = fd >= 0;
+        }
+        if (fd >= 0) store_test_after(KSEC_TEST_STORE_APPEND_OPEN);
     }
-    if (fd < 0 || safe_regular_fd(fd, 0600) != 0
-            || ksec_write_all(fd, entry, entry_len) != 0 || fsync(fd) != 0) {
+    if (fd < 0 || safe_regular_fd(fd, 0600) != 0) {
         int saved = errno;
         if (fd >= 0) (void)close(fd);
         sodium_memzero(entry, entry_len);
@@ -523,18 +677,33 @@ ksec_result ksec_store_append(ksec_store *store,
         errno = saved;
         return KSEC_ERR_IO;
     }
-    if (close(fd) != 0) {
+    write_attempted = true;
+    if (store_write_all(fd, entry, entry_len, KSEC_TEST_STORE_APPEND_WRITE) != 0
+            || store_fsync(fd, KSEC_TEST_STORE_APPEND_FSYNC) != 0) {
         int saved = errno;
+        (void)close(fd);
         sodium_memzero(entry, entry_len);
         free(entry);
+        store->torn_tail = write_attempted;
+        errno = saved;
+        return KSEC_ERR_IO;
+    }
+    if (store_close(fd, KSEC_TEST_STORE_APPEND_CLOSE) != 0) {
+        int saved = errno;
+        (void)close(fd);
+        sodium_memzero(entry, entry_len);
+        free(entry);
+        store->torn_tail = write_attempted;
         errno = saved;
         return KSEC_ERR_IO;
     }
     fd = -1;
-    if (created && ksec_sync_directory(store->data_dir) != 0) {
+    if (created && store_directory_sync(store->data_dir,
+                                       KSEC_TEST_STORE_APPEND_DIRSYNC) != 0) {
         int saved = errno;
         sodium_memzero(entry, entry_len);
         free(entry);
+        store->torn_tail = write_attempted;
         errno = saved;
         return KSEC_ERR_IO;
     }
@@ -560,7 +729,6 @@ ksec_result ksec_store_compact(ksec_store *store,
     size_t index;
     char temporary[4096];
     int fd = -1;
-    int count;
     ksec_result result = KSEC_OK;
     if (store == NULL || header == NULL || master_key == NULL || store->torn_tail) {
         return KSEC_ERR_INVALID;
@@ -572,19 +740,15 @@ ksec_result ksec_store_compact(ksec_store *store,
         if (!store->records[index].deleted) ordered[live++] = &store->records[index];
     }
     qsort(ordered, live, sizeof *ordered, compare_record_revision);
-    count = snprintf(temporary, sizeof temporary, "%s/.journal.ksj.tmp.%ld",
-                     store->data_dir, (long)getpid());
-    if (count < 0 || (size_t)count >= sizeof temporary) {
-        free(ordered);
-        return KSEC_ERR_LIMIT;
-    }
-    fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    fd = open_unique_temporary(store->data_dir, "journal.ksj", temporary,
+                               sizeof temporary, KSEC_TEST_STORE_COMPACT_OPEN);
     if (fd < 0) { free(ordered); return KSEC_ERR_IO; }
     for (index = 0; index < live; index++) {
         uint8_t *entry = NULL;
         size_t entry_len = 0;
         result = make_entry(header, master_key, ordered[index], false, &entry, &entry_len);
-        if (result != KSEC_OK || ksec_write_all(fd, entry, entry_len) != 0) {
+        if (result != KSEC_OK || store_write_all(fd, entry, entry_len,
+                                                 KSEC_TEST_STORE_COMPACT_WRITE) != 0) {
             if (result == KSEC_OK) result = KSEC_ERR_IO;
             if (entry != NULL) {
                 sodium_memzero(entry, entry_len);
@@ -605,7 +769,8 @@ ksec_result ksec_store_compact(ksec_store *store,
         checkpoint.object_type = KSEC_OBJECT_SECRET;
         checkpoint.revision = store->last_revision;
         result = make_entry(header, master_key, &checkpoint, true, &entry, &entry_len);
-        if (result == KSEC_OK && ksec_write_all(fd, entry, entry_len) != 0) {
+        if (result == KSEC_OK && store_write_all(
+                fd, entry, entry_len, KSEC_TEST_STORE_COMPACT_WRITE) != 0) {
             result = KSEC_ERR_IO;
         }
         if (entry != NULL) {
@@ -613,13 +778,25 @@ ksec_result ksec_store_compact(ksec_store *store,
             free(entry);
         }
     }
-    if (result == KSEC_OK && fsync(fd) != 0) result = KSEC_ERR_IO;
-    if (close(fd) != 0 && result == KSEC_OK) result = KSEC_ERR_IO;
-    fd = -1;
-    if (result == KSEC_OK && rename(temporary, store->journal_path) != 0) {
+    if (result == KSEC_OK
+            && store_fsync(fd, KSEC_TEST_STORE_COMPACT_FSYNC) != 0) {
         result = KSEC_ERR_IO;
     }
-    if (result == KSEC_OK && ksec_sync_directory(store->data_dir) != 0) {
+    if (result == KSEC_OK) {
+        if (store_close(fd, KSEC_TEST_STORE_COMPACT_CLOSE) != 0) {
+            result = KSEC_ERR_IO;
+            (void)close(fd);
+        }
+    } else {
+        (void)close(fd);
+    }
+    fd = -1;
+    if (result == KSEC_OK && store_rename(
+            temporary, store->journal_path, KSEC_TEST_STORE_COMPACT_RENAME) != 0) {
+        result = KSEC_ERR_IO;
+    }
+    if (result == KSEC_OK && store_directory_sync(
+            store->data_dir, KSEC_TEST_STORE_COMPACT_DIRSYNC) != 0) {
         result = KSEC_ERR_IO;
     }
     if (result != KSEC_OK) (void)unlink(temporary);

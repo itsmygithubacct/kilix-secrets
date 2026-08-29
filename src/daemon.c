@@ -175,6 +175,12 @@ static void lock_state(daemon_state *state) {
     state->last_authorized_use = 0;
 }
 
+static ksec_result finish_store_mutation(daemon_state *state,
+                                         ksec_result result) {
+    if (state != NULL && result != KSEC_OK) lock_state(state);
+    return result;
+}
+
 static ksec_result send_reply(daemon_connection *connection,
                               const ksec_packet_header *request,
                               ksec_result result, const uint8_t *extra,
@@ -280,38 +286,105 @@ static ksec_result handle_init(daemon_state *state, daemon_connection *connectio
                                int received_fd, int *reply_fd) {
     ksec_secure_buffer passphrase = {0};
     ksec_secure_buffer master = {0};
+    ksec_vault_header candidate;
     uint8_t recovery_raw[32];
     char recovery_hex[65];
     uint32_t selector;
+    uint32_t opslimit = 0;
+    uint64_t memlimit = 0;
+    bool retry_unconfirmed;
     ksec_result result;
+    memset(&candidate, 0, sizeof candidate);
     if (payload == NULL || payload_len != 4U || received_fd < 0) return KSEC_ERR_PROTOCOL;
     selector = ksec_get_u32(payload);
-    if (selector != 0U || state->initialized) return KSEC_ERR_EXISTS;
+    if (selector != 0U) return KSEC_ERR_INVALID;
+    retry_unconfirmed = state->initialized
+        && (state->header.flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) == 0U;
+    if (state->initialized && !retry_unconfirmed) return KSEC_ERR_EXISTS;
+    if (retry_unconfirmed && ksec_now_seconds() < state->retry_after) {
+        return KSEC_ERR_BUSY;
+    }
     result = authorize(state, connection, KSEC_VERB_CREATE,
                        connection->capability->app_id, NULL);
     if (result != KSEC_OK) return result;
-    if (!state->kdf_configured) return KSEC_ERR_INVALID;
+    if (!retry_unconfirmed && !state->kdf_configured) return KSEC_ERR_INVALID;
     result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
     if (result != KSEC_OK) return result;
     result = ksec_secure_alloc(&master, KSEC_MASTER_KEY_BYTES);
     if (result != KSEC_OK) goto out;
     randombytes_buf(recovery_raw, sizeof recovery_raw);
     ksec_hex_encode(recovery_raw, sizeof recovery_raw, recovery_hex);
-    result = audit_state_event(state, "init", "begin", connection->uid,
-                               connection->pid, connection->capability->app_id,
-                               NULL);
+    if (retry_unconfirmed) {
+        size_t index;
+        result = ksec_header_unlock(&state->header, KSEC_SLOT_PASSPHRASE,
+                                    passphrase.data, passphrase.len, master.data);
+        if (result != KSEC_OK) {
+            uint64_t now = ksec_now_seconds();
+            uint32_t shift = state->failed_unlocks < 3U
+                ? state->failed_unlocks : 3U;
+            state->failed_unlocks++;
+            state->retry_after = now + (UINT64_C(1) << shift);
+            (void)audit_state_event(state, "recovery", "denied",
+                                    connection->uid, connection->pid,
+                                    connection->capability->app_id, NULL);
+            goto out;
+        }
+        for (index = 0U; index < state->header.slot_count; index++) {
+            if (state->header.slots[index].slot_type
+                    == KSEC_SLOT_RECOVERY) {
+                opslimit = state->header.slots[index].opslimit;
+                memlimit = state->header.slots[index].memlimit;
+            }
+        }
+        candidate = state->header;
+        result = ksec_header_rewrap_slot(
+                &candidate, KSEC_SLOT_RECOVERY,
+                (const uint8_t *)recovery_hex, 64U, opslimit, memlimit,
+                master.data);
+    } else {
+        result = ksec_header_create(&candidate, passphrase.data, passphrase.len,
+                                    (const uint8_t *)recovery_hex, 64U,
+                                    state->argon_ops, state->argon_mem,
+                                    master.data);
+    }
     if (result != KSEC_OK) goto out;
-    result = ksec_header_create(&state->header, passphrase.data, passphrase.len,
-                                (const uint8_t *)recovery_hex, 64U,
-                                state->argon_ops, state->argon_mem, master.data);
+    result = sensitive_fd_from_bytes((const uint8_t *)recovery_hex, 64U,
+                                     reply_fd);
     if (result != KSEC_OK) goto out;
-    result = ksec_store_write_header(&state->store, &state->header);
+    result = audit_state_event(state, retry_unconfirmed ? "recovery" : "init",
+                               "begin", connection->uid, connection->pid,
+                               connection->capability->app_id, NULL);
     if (result != KSEC_OK) goto out;
+    result = ksec_store_write_header(&state->store, &candidate);
+    if (result != KSEC_OK) {
+        ksec_vault_header observed;
+        if (*reply_fd >= 0) {
+            (void)close(*reply_fd);
+            *reply_fd = -1;
+        }
+        if (ksec_store_read_header(&state->store, &observed) == KSEC_OK) {
+            state->header = observed;
+            state->initialized = true;
+            sodium_memzero(&observed, sizeof observed);
+        }
+        (void)finish_store_mutation(state, result);
+        goto out;
+    }
+    state->header = candidate;
     state->initialized = true;
-    result = sensitive_fd_from_bytes((const uint8_t *)recovery_hex, 64U, reply_fd);
+    state->failed_unlocks = 0U;
+    state->retry_after = 0U;
+    (void)audit_state_event(state, retry_unconfirmed ? "recovery" : "init",
+                            "ok", connection->uid, connection->pid,
+                            connection->capability->app_id, NULL);
 out:
+    if (result != KSEC_OK && *reply_fd >= 0) {
+        (void)close(*reply_fd);
+        *reply_fd = -1;
+    }
     sodium_memzero(recovery_raw, sizeof recovery_raw);
     sodium_memzero(recovery_hex, sizeof recovery_hex);
+    sodium_memzero(&candidate, sizeof candidate);
     ksec_secure_free(&master);
     ksec_secure_free(&passphrase);
     return result;
@@ -370,7 +443,10 @@ static ksec_result handle_unlock(daemon_state *state, daemon_connection *connect
         result = ksec_header_confirm_recovery(&confirmed, master.data);
         if (result != KSEC_OK) goto out;
         result = ksec_store_write_header(&state->store, &confirmed);
-        if (result != KSEC_OK) goto out;
+        if (result != KSEC_OK) {
+            (void)finish_store_mutation(state, result);
+            goto out;
+        }
         state->header = confirmed;
         (void)audit_state_event(state, "recovery", "confirmed", connection->uid,
                                 connection->pid,
@@ -388,6 +464,58 @@ static ksec_result handle_unlock(daemon_state *state, daemon_connection *connect
 out:
     ksec_secure_free(&master);
     ksec_secure_free(&secret);
+    return result;
+}
+
+static ksec_result handle_change_passphrase(
+        daemon_state *state, daemon_connection *connection,
+        const uint8_t *payload, size_t payload_len, int received_fd) {
+    ksec_secure_buffer passphrase = {0};
+    ksec_vault_header candidate;
+    uint32_t selector;
+    uint32_t opslimit = 0U;
+    uint64_t memlimit = 0U;
+    size_t index;
+    ksec_result result;
+    memset(&candidate, 0, sizeof candidate);
+    if (payload == NULL || payload_len != 4U || received_fd < 0) {
+        return KSEC_ERR_PROTOCOL;
+    }
+    selector = ksec_get_u32(payload);
+    if (selector != 0U) return KSEC_ERR_INVALID;
+    if (!state->unlocked) return KSEC_ERR_LOCKED;
+    result = authorize(state, connection, KSEC_VERB_REPLACE,
+                       connection->capability->app_id, NULL);
+    if (result != KSEC_OK) return result;
+    result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
+    if (result != KSEC_OK) return result;
+    for (index = 0U; index < state->header.slot_count; index++) {
+        if (state->header.slots[index].slot_type == KSEC_SLOT_PASSPHRASE) {
+            opslimit = state->header.slots[index].opslimit;
+            memlimit = state->header.slots[index].memlimit;
+        }
+    }
+    result = audit_state_event(state, "passphrase-change", "begin",
+                               connection->uid, connection->pid,
+                               connection->capability->app_id, NULL);
+    if (result != KSEC_OK) goto out;
+    candidate = state->header;
+    result = ksec_header_rewrap_slot(&candidate, KSEC_SLOT_PASSPHRASE,
+                                     passphrase.data, passphrase.len,
+                                     opslimit, memlimit, state->master.data);
+    if (result != KSEC_OK) goto out;
+    result = ksec_store_write_header(&state->store, &candidate);
+    if (result != KSEC_OK) {
+        result = finish_store_mutation(state, result);
+        goto out;
+    }
+    state->header = candidate;
+    (void)audit_state_event(state, "passphrase-change", "ok",
+                            connection->uid, connection->pid,
+                            connection->capability->app_id, NULL);
+out:
+    sodium_memzero(&candidate, sizeof candidate);
+    ksec_secure_free(&passphrase);
     return result;
 }
 
@@ -461,6 +589,7 @@ static ksec_result handle_put(daemon_state *state, daemon_connection *connection
     if (result != KSEC_OK) goto out;
     result = ksec_store_append(&state->store, &state->header, state->master.data,
                                &record, false);
+    result = finish_store_mutation(state, result);
 out:
     ksec_owned_record_clear(&record);
     ksec_secure_free(&encoded);
@@ -535,6 +664,7 @@ static ksec_result handle_delete(daemon_state *state, daemon_connection *connect
     tombstone.object_type = existing->object_type;
     result = ksec_store_append(&state->store, &state->header, state->master.data,
                                &tombstone, true);
+    result = finish_store_mutation(state, result);
     ksec_owned_record_clear(&tombstone);
     return result;
 }
@@ -672,8 +802,12 @@ static ksec_result dispatch_request(daemon_state *state, daemon_connection *conn
                                        connection->uid, connection->pid,
                                        connection->capability->app_id, NULL);
             if (result != KSEC_OK) return result;
-            return ksec_store_compact(&state->store, &state->header,
-                                      state->master.data);
+            return finish_store_mutation(
+                    state, ksec_store_compact(&state->store, &state->header,
+                                              state->master.data));
+        case KSEC_OP_CHANGE_PASSPHRASE:
+            return handle_change_passphrase(state, connection, payload,
+                                            request->payload_len, received_fd);
         default:
             return KSEC_ERR_PROTOCOL;
     }

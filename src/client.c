@@ -281,6 +281,13 @@ ksec_result ksec_unlock(ksec_client *client, ksec_slot_type slot_type,
                                 secret_input_fd, -1);
 }
 
+ksec_result ksec_change_passphrase(ksec_client *client,
+                                   int new_passphrase_fd) {
+    if (new_passphrase_fd < 0) return KSEC_ERR_INVALID;
+    return lifecycle_with_input(client, KSEC_OP_CHANGE_PASSPHRASE, 0U,
+                                new_passphrase_fd, -1);
+}
+
 static ksec_result simple_request(ksec_client *client, uint16_t operation,
                                   const uint8_t *payload, uint32_t payload_len,
                                   int *returned_fd, uint8_t *response,

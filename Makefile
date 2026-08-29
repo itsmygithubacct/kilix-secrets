@@ -54,6 +54,10 @@ $(BUILD)/kilix-secretsd: src/daemon.c $(BUILD)/libkilix-secrets.a
 $(BUILD)/kilix-secrets: tools/kilix-secrets.c $(BUILD)/libkilix-secrets.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(BUILD)/libkilix-secrets.a $(LDLIBS)
 
+$(BUILD)/generate-vectors: tools/generate_vectors.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
 $(BUILD)/kilix-secrets.pc: kilix-secrets.pc.in | $(BUILD)
 	sed 's|@PREFIX@|$(PREFIX)|g' $< > $@
 
@@ -61,13 +65,25 @@ $(BUILD)/test-unit: tests/test_unit.c $(LIB_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DKSEC_TESTING $(LDFLAGS) -o $@ $< \
 		$(LIB_SOURCES) $(LDLIBS)
 
+$(BUILD)/test-crash: tests/test_crash.c $(LIB_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKSEC_TESTING $(LDFLAGS) -o $@ $< \
+		$(LIB_SOURCES) $(LDLIBS)
+
+$(BUILD)/test-vectors: tests/test_vectors.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
 $(BUILD)/parser-harness: tests/parser_harness.c $(BUILD)/libkilix-secrets.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
 		$(BUILD)/libkilix-secrets.a $(LDLIBS)
 
-test: all $(BUILD)/test-unit $(BUILD)/parser-harness
+test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
+	$(BUILD)/generate-vectors $(BUILD)/parser-harness
 	test -d "$(TEST_TMPDIR)" && test ! -L "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-unit
+	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-crash
+	$(BUILD)/generate-vectors | cmp - tests/vectors/full-v1.txt
+	$(BUILD)/test-vectors
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_integration.py --build-dir $(BUILD)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/check_manifests.py

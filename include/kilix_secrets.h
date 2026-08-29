@@ -88,6 +88,8 @@ ksec_result ksec_vault_init(ksec_client *client, int passphrase_fd,
 ksec_result ksec_unlock(ksec_client *client, ksec_slot_type slot_type,
                         int secret_input_fd);
 ksec_result ksec_lock(ksec_client *client);
+ksec_result ksec_change_passphrase(ksec_client *client,
+                                   int new_passphrase_fd);
 
 ksec_result ksec_put(ksec_client *client, const ksec_record *record,
                      uint8_t record_id[KSEC_RECORD_ID_BYTES]);

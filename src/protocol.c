@@ -31,7 +31,7 @@ ksec_result ksec_packet_encode(const ksec_packet_header *header,
     size_t total;
     if (header == NULL || output == NULL || output_length == NULL
             || header->version != KSEC_PROTOCOL_VERSION
-            || header->operation < KSEC_OP_ACTIVATE || header->operation > KSEC_OP_COMPACT
+            || header->operation < KSEC_OP_ACTIVATE || header->operation > KSEC_OP_MAX
             || header->flags != 0U || header->payload_len > KSEC_PROTOCOL_MAX_PAYLOAD
             || (header->payload_len > 0U && payload == NULL)) return KSEC_ERR_INVALID;
     total = KSEC_PROTOCOL_HEADER_BYTES + header->payload_len;
@@ -60,7 +60,7 @@ ksec_result ksec_packet_decode(const uint8_t *input, size_t input_length,
     header->request_id = ksec_get_u64(input + 12U);
     header->payload_len = ksec_get_u32(input + 20U);
     if (header->version != KSEC_PROTOCOL_VERSION || header->flags != 0U
-            || header->operation < KSEC_OP_ACTIVATE || header->operation > KSEC_OP_COMPACT
+            || header->operation < KSEC_OP_ACTIVATE || header->operation > KSEC_OP_MAX
             || header->payload_len > KSEC_PROTOCOL_MAX_PAYLOAD
             || input_length != KSEC_PROTOCOL_HEADER_BYTES + header->payload_len) {
         return KSEC_ERR_PROTOCOL;

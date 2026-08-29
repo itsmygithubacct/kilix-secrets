@@ -301,6 +301,102 @@ ksec_result ksec_header_confirm_recovery(
     return result;
 }
 
+ksec_result ksec_header_rewrap_slot(
+        ksec_vault_header *header, ksec_slot_type slot_type,
+        const uint8_t *new_secret, size_t new_secret_len,
+        uint32_t opslimit, uint64_t memlimit,
+        const uint8_t master_key[KSEC_MASTER_KEY_BYTES]) {
+    ksec_vault_header previous;
+    ksec_key_slot *slot = NULL;
+    size_t index;
+    ksec_result result;
+    if (header == NULL || new_secret == NULL || master_key == NULL
+            || (slot_type != KSEC_SLOT_PASSPHRASE
+                && slot_type != KSEC_SLOT_RECOVERY)
+            || (slot_type == KSEC_SLOT_PASSPHRASE && new_secret_len < 8U)
+            || (slot_type == KSEC_SLOT_RECOVERY && new_secret_len < 32U)
+            || new_secret_len > 1024U
+            || opslimit < KSEC_ARGON_OPS_MIN || opslimit > KSEC_ARGON_OPS_MAX
+            || memlimit < KSEC_ARGON_MEM_MIN || memlimit > KSEC_ARGON_MEM_MAX
+            || header->generation == UINT64_MAX) return KSEC_ERR_INVALID;
+    result = verify_header(header, master_key);
+    if (result != KSEC_OK) return result;
+    for (index = 0; index < header->slot_count; index++) {
+        if (header->slots[index].slot_type == (uint16_t)slot_type) {
+            if (slot != NULL) return KSEC_ERR_INVALID;
+            slot = &header->slots[index];
+        }
+    }
+    if (slot == NULL) return KSEC_ERR_NOT_FOUND;
+    previous = *header;
+    header->generation++;
+    slot->opslimit = opslimit;
+    slot->memlimit = memlimit;
+    randombytes_buf(slot->slot_id, KSEC_SLOT_ID_BYTES);
+    randombytes_buf(slot->salt, KSEC_SALT_BYTES);
+    result = wrap_slot(header, slot, new_secret, new_secret_len, master_key);
+    if (result == KSEC_OK) result = authenticate_header(header, master_key);
+    if (result != KSEC_OK) *header = previous;
+    sodium_memzero(&previous, sizeof previous);
+    return result;
+}
+
+ksec_result ksec_header_rotate_master(
+        ksec_vault_header *header,
+        const uint8_t old_master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t new_master_key[KSEC_MASTER_KEY_BYTES],
+        const uint8_t *passphrase, size_t passphrase_len,
+        const uint8_t *recovery, size_t recovery_len,
+        uint32_t opslimit, uint64_t memlimit) {
+    ksec_vault_header previous;
+    size_t index;
+    ksec_result result;
+    if (header == NULL || old_master_key == NULL || new_master_key == NULL
+            || passphrase == NULL || recovery == NULL
+            || passphrase_len < 8U || passphrase_len > 1024U
+            || recovery_len < 32U || recovery_len > 1024U
+            || opslimit < KSEC_ARGON_OPS_MIN || opslimit > KSEC_ARGON_OPS_MAX
+            || memlimit < KSEC_ARGON_MEM_MIN || memlimit > KSEC_ARGON_MEM_MAX
+            || header->generation == UINT64_MAX
+            || (header->flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) == 0U
+            || sodium_memcmp(old_master_key, new_master_key,
+                             KSEC_MASTER_KEY_BYTES) == 0) return KSEC_ERR_INVALID;
+    result = verify_header(header, old_master_key);
+    if (result != KSEC_OK) return result;
+    previous = *header;
+    header->generation++;
+    for (index = 0; index < header->slot_count; index++) {
+        ksec_key_slot *slot = &header->slots[index];
+        const uint8_t *secret;
+        size_t secret_len;
+        if (slot->slot_type == KSEC_SLOT_PASSPHRASE) {
+            secret = passphrase;
+            secret_len = passphrase_len;
+        } else if (slot->slot_type == KSEC_SLOT_RECOVERY) {
+            secret = recovery;
+            secret_len = recovery_len;
+        } else {
+            result = KSEC_ERR_INVALID;
+            goto fail;
+        }
+        slot->opslimit = opslimit;
+        slot->memlimit = memlimit;
+        randombytes_buf(slot->slot_id, KSEC_SLOT_ID_BYTES);
+        randombytes_buf(slot->salt, KSEC_SALT_BYTES);
+        result = wrap_slot(header, slot, secret, secret_len, new_master_key);
+        if (result != KSEC_OK) goto fail;
+    }
+    result = authenticate_header(header, new_master_key);
+    if (result == KSEC_OK) {
+        sodium_memzero(&previous, sizeof previous);
+        return KSEC_OK;
+    }
+fail:
+    *header = previous;
+    sodium_memzero(&previous, sizeof previous);
+    return result;
+}
+
 ksec_result ksec_header_encode(const ksec_vault_header *header, uint8_t *output,
                                size_t output_size, size_t *output_length) {
     ksec_result result;

@@ -365,12 +365,17 @@ static void test_protocol(void) {
 static void test_crypto(void) {
     static const uint8_t passphrase[] = "synthetic-passphrase";
     static const uint8_t wrong_passphrase[] = "synthetic-wrong-passphrase";
+    static const uint8_t new_passphrase[] = "synthetic-new-passphrase";
     static const uint8_t recovery[] =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     ksec_vault_header header;
     ksec_vault_header decoded;
     ksec_vault_header tampered;
+    ksec_vault_header rewrapped;
+    ksec_vault_header rotated;
+    ksec_vault_header previous;
     uint8_t master[KSEC_MASTER_KEY_BYTES];
+    uint8_t new_master[KSEC_MASTER_KEY_BYTES];
     uint8_t unlocked[KSEC_MASTER_KEY_BYTES];
     uint8_t encoded[1024];
     size_t encoded_len = 0;
@@ -421,6 +426,62 @@ static void test_crypto(void) {
     CHECK((decoded.flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) != 0U
           && decoded.generation == 2U);
     CHECK(ksec_header_confirm_recovery(&decoded, unlocked) == KSEC_ERR_EXISTS);
+    rewrapped = decoded;
+    CHECK(ksec_header_rewrap_slot(&rewrapped, KSEC_SLOT_PASSPHRASE,
+                                  new_passphrase,
+                                  sizeof new_passphrase - 1U,
+                                  KSEC_ARGON_OPS_MIN, KSEC_ARGON_MEM_MIN,
+                                  master) == KSEC_OK);
+    CHECK(rewrapped.generation == decoded.generation + 1U);
+    CHECK(ksec_header_unlock(&rewrapped, KSEC_SLOT_PASSPHRASE,
+                             passphrase, sizeof passphrase - 1U,
+                             unlocked) == KSEC_ERR_CRYPTO);
+    CHECK(ksec_header_unlock(&rewrapped, KSEC_SLOT_PASSPHRASE,
+                             new_passphrase, sizeof new_passphrase - 1U,
+                             unlocked) == KSEC_OK
+          && memcmp(unlocked, master, sizeof master) == 0);
+    CHECK(ksec_header_unlock(&rewrapped, KSEC_SLOT_RECOVERY,
+                             recovery, sizeof recovery - 1U,
+                             unlocked) == KSEC_OK
+          && memcmp(unlocked, master, sizeof master) == 0);
+    previous = rewrapped;
+    CHECK(ksec_header_rewrap_slot(&rewrapped, KSEC_SLOT_PASSPHRASE,
+                                  new_passphrase,
+                                  sizeof new_passphrase - 1U,
+                                  KSEC_ARGON_OPS_MIN - 1U,
+                                  KSEC_ARGON_MEM_MIN, master)
+          == KSEC_ERR_INVALID);
+    CHECK(memcmp(&rewrapped, &previous, sizeof rewrapped) == 0);
+    fill_sequence(new_master, sizeof new_master, 0x90U);
+    rotated = rewrapped;
+    CHECK(ksec_header_rotate_master(&rotated, master, new_master,
+                                    new_passphrase,
+                                    sizeof new_passphrase - 1U,
+                                    recovery, sizeof recovery - 1U,
+                                    KSEC_ARGON_OPS_MIN,
+                                    KSEC_ARGON_MEM_MIN) == KSEC_OK);
+    CHECK(rotated.generation == rewrapped.generation + 1U);
+    CHECK(ksec_header_unlock(&rotated, KSEC_SLOT_PASSPHRASE,
+                             new_passphrase, sizeof new_passphrase - 1U,
+                             unlocked) == KSEC_OK
+          && memcmp(unlocked, new_master, sizeof new_master) == 0);
+    CHECK(ksec_header_unlock(&rotated, KSEC_SLOT_RECOVERY,
+                             recovery, sizeof recovery - 1U,
+                             unlocked) == KSEC_OK
+          && memcmp(unlocked, new_master, sizeof new_master) == 0);
+    previous = rotated;
+    CHECK(ksec_header_rotate_master(&rotated, new_master, new_master,
+                                    new_passphrase,
+                                    sizeof new_passphrase - 1U,
+                                    recovery, sizeof recovery - 1U,
+                                    KSEC_ARGON_OPS_MIN,
+                                    KSEC_ARGON_MEM_MIN) == KSEC_ERR_INVALID);
+    CHECK(memcmp(&rotated, &previous, sizeof rotated) == 0);
+    sodium_memzero(new_master, sizeof new_master);
+    sodium_memzero(&rewrapped, sizeof rewrapped);
+    sodium_memzero(&rotated, sizeof rotated);
+    sodium_memzero(&previous, sizeof previous);
+    sodium_memzero(unlocked, sizeof unlocked);
     CHECK(ksec_header_encode(&decoded, encoded, sizeof encoded,
                              &encoded_len) == KSEC_OK);
     CHECK(ksec_header_decode(encoded, encoded_len, &fixture_header) == KSEC_OK);

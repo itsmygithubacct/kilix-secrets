@@ -15,6 +15,18 @@ Format v1 registries contain only Argon2id v1.3 (`pwhash_id=1`), libsodium
 XChaCha20-Poly1305 (`aead_id=1`). ID zero and every unknown value are invalid.
 Each object and key slot carries a fresh random 24-byte nonce.
 
+Passphrase change leaves the random master key and recovery slot unchanged,
+creates a fresh passphrase slot ID, salt, and nonce, increments the authenticated
+header generation, and atomically replaces the header. An initialization whose
+recovery rendering was lost may be retried only while recovery remains
+unconfirmed and only after the existing passphrase slot authenticates; retry
+replaces the recovery slot with fresh material and never activates the vault.
+
+`tests/vectors/full-v1.txt` freezes one complete synthetic passphrase slot,
+recovery slot, authenticated header, serialized record, record associated data,
+terminal keys, nonces, ciphertext, and tag. The generator is reproduced during
+both normal and sanitizer test gates and its output must be byte-identical.
+
 The portable journal can identify a torn final record but never accepts an
 authentication failure in a complete earlier record. A damaged file is retained
 for explicit recovery. Whole-file offline rollback is not prevented.

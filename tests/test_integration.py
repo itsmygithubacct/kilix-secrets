@@ -149,8 +149,10 @@ def main() -> int:
     runtime.mkdir(mode=0o700)
     process: subprocess.Popen[bytes] | None = None
     passphrase = bytearray(secrets.token_bytes(32))
+    previous_passphrase = bytearray()
     record_secret = bytearray(secrets.token_bytes(47))
     recovery = bytearray()
+    previous_recovery = bytearray()
     try:
         process = start_daemon(daemon, socket_path, data_dir)
         checks.check(process.poll() is None, "daemon remains running")
@@ -173,6 +175,15 @@ def main() -> int:
                      "passphrase is absent from initialization output")
         checks.check(bytes(recovery) not in initialized.stdout + initialized.stderr,
                      "recovery is absent from ordinary stdout and stderr")
+
+        previous_recovery.extend(recovery)
+        retried_init, retried_recovery = run_init(
+            cli, socket_path, "kilix-secrets.test", bytes(passphrase))
+        checks.check(retried_init.returncode == 0 and len(retried_recovery) == 64,
+                     "unconfirmed initialization can replace a lost recovery rendering")
+        checks.check(retried_recovery != bytes(previous_recovery),
+                     "recovery retry mints a fresh independent secret")
+        recovery[:] = retried_recovery
 
         refused = run_cli(cli, socket_path, "kilix-secrets.test", ["unlock"],
                           bytes(passphrase))
@@ -231,6 +242,32 @@ def main() -> int:
                            bytes(passphrase))
         checks.check(unlocked.returncode == 0,
                      "confirmed vault unlocks with the passphrase slot")
+
+        previous_passphrase.extend(passphrase)
+        replacement_passphrase = secrets.token_bytes(32)
+        changed = run_cli(cli, socket_path, "kilix-secrets.test", ["passwd"],
+                          replacement_passphrase)
+        checks.check(changed.returncode == 0,
+                     "passphrase slot rotation succeeds while unlocked")
+        passphrase[:] = replacement_passphrase
+        locked_after_change = run_cli(cli, socket_path, "kilix-secrets.test", ["lock"])
+        checks.check(locked_after_change.returncode == 0,
+                     "passphrase rotation leaves explicit lock available")
+        stop_daemon(process)
+        process = None
+        process = start_daemon(daemon, socket_path, data_dir)
+        old_unlock = run_cli(cli, socket_path, "kilix-secrets.test", ["unlock"],
+                             bytes(previous_passphrase))
+        checks.check(old_unlock.returncode != 0
+                     and b"authentication failure" in old_unlock.stderr,
+                     "retired passphrase no longer unwraps the master key")
+        stop_daemon(process)
+        process = None
+        process = start_daemon(daemon, socket_path, data_dir)
+        changed_unlock = run_cli(cli, socket_path, "kilix-secrets.test", ["unlock"],
+                                 bytes(passphrase))
+        checks.check(changed_unlock.returncode == 0,
+                     "replacement passphrase survives daemon restart")
 
         stop_daemon(process)
         process = None
@@ -298,8 +335,14 @@ def main() -> int:
         journal = (data_dir / "journal.ksj").read_bytes()
         checks.check(bytes(passphrase) not in audit + rotated_audit + vault + journal,
                      "passphrase is absent from audit and persistent files")
+        checks.check(bytes(previous_passphrase)
+                     not in audit + rotated_audit + vault + journal,
+                     "retired passphrase is absent from audit and persistent files")
         checks.check(bytes(recovery) not in audit + rotated_audit + vault + journal,
                      "recovery secret is absent from audit and persistent files")
+        checks.check(bytes(previous_recovery)
+                     not in audit + rotated_audit + vault + journal,
+                     "superseded recovery secret is absent from persistent files")
         checks.check(bytes(record_secret) not in audit + rotated_audit + vault + journal,
                      "record secret is absent from audit and persistent files")
         checks.check(b"Synthetic integration" not in journal,
@@ -317,8 +360,10 @@ def main() -> int:
         if process is not None:
             stop_daemon(process)
         passphrase[:] = b"\x00" * len(passphrase)
+        previous_passphrase[:] = b"\x00" * len(previous_passphrase)
         record_secret[:] = b"\x00" * len(record_secret)
         recovery[:] = b"\x00" * len(recovery)
+        previous_recovery[:] = b"\x00" * len(previous_recovery)
         resolved = root.resolve()
         required_parent = scratch.resolve()
         if resolved.parent == required_parent and resolved.name.startswith("ksec-integration."):

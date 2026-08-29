@@ -28,6 +28,7 @@ static void usage(FILE *stream) {
             "  init [--secret-fd N] [--recovery-fd N]\n"
             "  unlock [--recovery] [--secret-fd N]\n"
             "  lock\n"
+            "  passwd [--secret-fd N]\n"
             "  add --type TYPE --label LABEL --field NAME [--secret-fd N]\n"
             "  run RECORD FIELD -- COMMAND [ARG ...]\n"
             "  list\n"
@@ -102,6 +103,7 @@ static uint32_t command_verbs(const char *command) {
     if (strcmp(command, "init") == 0) return KSEC_VERB_CREATE | KSEC_VERB_READ;
     if (strcmp(command, "add") == 0) return KSEC_VERB_CREATE;
     if (strcmp(command, "unlock") == 0 || strcmp(command, "lock") == 0) return KSEC_VERB_READ;
+    if (strcmp(command, "passwd") == 0) return KSEC_VERB_REPLACE;
     if (strcmp(command, "run") == 0) return KSEC_VERB_USE;
     if (strcmp(command, "list") == 0) return KSEC_VERB_LIST_OWN;
     if (strcmp(command, "delete") == 0) return KSEC_VERB_DELETE;
@@ -258,6 +260,22 @@ init_out:
         if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
     } else if (strcmp(command, "lock") == 0 && request->argc == 1) {
         result = ksec_lock(client);
+    } else if (strcmp(command, "passwd") == 0) {
+        int secret_fd = -1;
+        if (request->argc == 3
+                && strcmp(request->argv[1], "--secret-fd") == 0
+                && parse_fd(request->argv[2], &secret_fd) == 0) {
+            result = KSEC_OK;
+        } else if (request->argc == 1) {
+            secret_fd = prompt_secret_fd("New passphrase: ", 8U);
+            result = secret_fd < 0 ? KSEC_ERR_INVALID : KSEC_OK;
+        } else {
+            result = KSEC_ERR_INVALID;
+        }
+        if (result == KSEC_OK) {
+            result = ksec_change_passphrase(client, secret_fd);
+        }
+        if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
     } else if (strcmp(command, "add") == 0) {
         const char *type = NULL;
         const char *label = NULL;
