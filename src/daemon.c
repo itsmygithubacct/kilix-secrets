@@ -1819,7 +1819,8 @@ static int create_listener(const char *socket_path) {
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, socket_path, path_len + 1U);
     if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0
-            || chmod(socket_path, 0600) != 0 || listen(fd, 32) != 0) {
+            || chmod(socket_path, 0600) != 0
+            || listen(fd, (int)KSEC_MAX_CONNECTIONS) != 0) {
         int saved = errno;
         (void)close(fd);
         (void)unlink(socket_path);
@@ -1910,9 +1911,11 @@ static int serve(int listener, daemon_state *state) {
             }
         }
         if ((pollfds[0].revents & POLLIN) != 0) {
-            daemon_connection incoming;
-            bool placed = false;
-            if (accept_connection(listener, &incoming) == 0) {
+            size_t admitted;
+            for (admitted = 0; admitted < KSEC_MAX_CONNECTIONS; admitted++) {
+                daemon_connection incoming;
+                bool placed = false;
+                if (accept_connection(listener, &incoming) != 0) break;
                 for (index = 0; index < KSEC_MAX_CONNECTIONS; index++) {
                     if (connections[index].fd < 0) {
                         connections[index] = incoming;
