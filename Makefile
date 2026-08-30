@@ -106,6 +106,8 @@ test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
 		python3 tests/test_identity.py --build-dir $(BUILD)
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_limits.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_activation.py --build-dir $(BUILD)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/check_manifests.py
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/run_negative_corpus.py \
 		--build-dir $(BUILD) --cases 4096

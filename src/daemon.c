@@ -124,6 +124,14 @@ static int validate_systemd_listener(int fd) {
     if (getsockname(fd, (struct sockaddr *)&address, &address_len) != 0
             || address_len < sizeof address.sun_family
             || address.sun_family != AF_UNIX || address.sun_path[0] == '\0') return -1;
+    /*
+     * The event loop drains the accept queue until accept4() reports EAGAIN,
+     * so a blocking listener would sleep inside accept4() and stall the single
+     * daemon thread. A self-created listener gets SOCK_NONBLOCK at creation;
+     * an inherited one carries whatever the activator chose, so establish the
+     * property here rather than depending on it.
+     */
+    if (ksec_set_nonblock(fd, true) != 0) return -1;
     return ksec_set_cloexec(fd, true);
 }
 

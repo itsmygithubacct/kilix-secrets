@@ -205,6 +205,7 @@ int ksec_write_all(int fd, const void *data, size_t length);
 int ksec_read_exact(int fd, void *data, size_t length);
 int ksec_copy_fd(int input_fd, int output_fd, size_t limit, size_t *copied);
 int ksec_set_cloexec(int fd, bool enabled);
+int ksec_set_nonblock(int fd, bool enabled);
 int ksec_sync_directory(const char *path);
 int ksec_parent_directory(const char *path, char *output, size_t output_size);
 int ksec_validate_secure_directory(const char *path, bool require_user_leaf);

@@ -115,6 +115,14 @@ int ksec_set_cloexec(int fd, bool enabled) {
     return fcntl(fd, F_SETFD, flags);
 }
 
+int ksec_set_nonblock(int fd, bool enabled) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return -1;
+    if (enabled) flags |= O_NONBLOCK;
+    else flags &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, flags);
+}
+
 int ksec_sync_directory(const char *path) {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     int saved;
