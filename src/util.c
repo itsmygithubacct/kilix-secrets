@@ -115,6 +115,17 @@ int ksec_set_cloexec(int fd, bool enabled) {
     return fcntl(fd, F_SETFD, flags);
 }
 
+/*
+ * 1 = non-blocking, 0 = blocking, -1 = unusable descriptor. Callers that depend
+ * on non-blocking semantics must treat anything other than 1 as fatal, so the
+ * error case never reads as "probably fine".
+ */
+int ksec_fd_is_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return -1;
+    return (flags & O_NONBLOCK) != 0 ? 1 : 0;
+}
+
 int ksec_set_nonblock(int fd, bool enabled) {
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0) return -1;

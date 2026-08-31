@@ -1869,16 +1869,16 @@ static int serve(int listener, daemon_state *state) {
     daemon_connection connections[KSEC_MAX_CONNECTIONS];
     struct pollfd pollfds[KSEC_MAX_CONNECTIONS + 2U];
     size_t index;
-    int listener_flags = fcntl(listener, F_GETFL);
     /*
      * The accept-drain loop below stops on EAGAIN, so a blocking listener would
      * sleep inside accept4() and stall this single thread indefinitely. Both
      * listener paths establish O_NONBLOCK -- create_listener() at creation and
      * validate_systemd_listener() on the inherited descriptor -- but the
-     * dependence lives here, so enforce it here as well and fail closed. A
-     * future third listener path then cannot reintroduce the hang silently.
+     * dependence lives here, so enforce it here as well and fail closed on a
+     * blocking descriptor and on an unusable one alike. A future third listener
+     * path then cannot reintroduce the hang silently.
      */
-    if (listener_flags < 0 || (listener_flags & O_NONBLOCK) == 0) return -1;
+    if (ksec_fd_is_nonblocking(listener) != 1) return -1;
     for (index = 0; index < KSEC_MAX_CONNECTIONS; index++) connections[index].fd = -1;
     while (!stop_requested) {
         int ready;

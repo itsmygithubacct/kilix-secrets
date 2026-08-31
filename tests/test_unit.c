@@ -61,6 +61,44 @@ static int count_open_fds(void) {
     return count;
 }
 
+/*
+ * The accept-drain loop in serve() fails closed unless the listener is
+ * non-blocking; two seats rejected a candidate over that precondition. The
+ * guard itself is unreachable by construction, so test the predicate it
+ * depends on directly rather than leaving a control nothing has watched fail.
+ */
+static void test_nonblocking_predicate(void) {
+    int pair[2];
+    int closed_fd;
+
+    CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0);
+
+    /* A freshly created descriptor is blocking: the predicate must say so. */
+    CHECK(ksec_fd_is_nonblocking(pair[0]) == 0);
+
+    /* After the daemon's own setter it must report non-blocking. */
+    CHECK(ksec_set_nonblock(pair[0], true) == 0);
+    CHECK(ksec_fd_is_nonblocking(pair[0]) == 1);
+
+    /* And the setter must be reversible, so 1 is not simply what it returns. */
+    CHECK(ksec_set_nonblock(pair[0], false) == 0);
+    CHECK(ksec_fd_is_nonblocking(pair[0]) == 0);
+
+    /* An unusable descriptor is -1, never 0 or 1: the guard fails closed. */
+    closed_fd = pair[1];
+    CHECK(close(closed_fd) == 0);
+    CHECK(ksec_fd_is_nonblocking(closed_fd) == -1);
+    CHECK(ksec_fd_is_nonblocking(-1) == -1);
+
+    /* The guard's own condition, stated as serve() states it. */
+    CHECK((ksec_fd_is_nonblocking(pair[0]) != 1));      /* blocking  -> refuse */
+    CHECK(ksec_set_nonblock(pair[0], true) == 0);
+    CHECK(!(ksec_fd_is_nonblocking(pair[0]) != 1));     /* nonblock  -> admit  */
+    CHECK((ksec_fd_is_nonblocking(closed_fd) != 1));    /* unusable  -> refuse */
+
+    (void)close(pair[0]);
+}
+
 static void test_utilities(void) {
     uint8_t bytes[8];
     uint8_t decoded[4];
@@ -893,6 +931,7 @@ int main(void) {
         return 1;
     }
     test_utilities();
+    test_nonblocking_predicate();
     test_ad_vectors();
     test_record_codec();
     test_protocol();
