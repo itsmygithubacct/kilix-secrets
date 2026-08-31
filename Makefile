@@ -34,7 +34,7 @@ LIB_DEPS := $(LIB_OBJECTS:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test sanitize fuzz install uninstall check-deps package-test deb deb-test
+.PHONY: all clean test sanitize fuzz install uninstall check-deps package-test deb deb-test calibrate
 
 all: $(BUILD)/libkilix-secrets.a $(BUILD)/libkilix-secrets.so.0 \
 	$(BUILD)/kilix-secretsd $(BUILD)/kilix-secrets $(BUILD)/kilix-secrets.pc
@@ -119,6 +119,11 @@ sanitize:
 	$(MAKE) test BUILD=build-sanitize \
 		CFLAGS='-O1 -g -std=c11 -fPIC -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2 -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' \
 		LDFLAGS='-fsanitize=address,undefined'
+
+# Not part of `all` or `install`: a measurement harness, not a shipped artifact.
+calibrate: | $(BUILD)
+	$(CC) -O2 -std=c11 -static $(CPPFLAGS) -o $(BUILD)/h0-calibrate \
+		tools/h0-calibrate.c $(SODIUM_LDLIBS) -lpthread
 
 fuzz: all $(BUILD)/parser-harness
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/run_negative_corpus.py \
