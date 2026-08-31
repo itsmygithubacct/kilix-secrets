@@ -1,0 +1,14 @@
+Package: kilix-secrets
+Version: @VERSION@
+Architecture: @ARCHITECTURE@
+Maintainer: itsmygithubacct <itsmygithubacct@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6 (>= 2.34), libsodium23 (>= 1.0.18), libsystemd0 (>= 257)
+Section: utils
+Priority: optional
+Homepage: https://github.com/itsmygithubacct/kilix-secrets
+X-Kilix-Source-Commit: @SOURCE_COMMIT@
+X-Kilix-Source-Tree: @SOURCE_TREE@
+Description: per-user credential vault for Kilix
+ Kilix Secrets provides a per-user daemon, administrative CLI, and C client
+ library for encrypted local credentials and descriptor-based delivery.

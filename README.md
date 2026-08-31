@@ -26,10 +26,16 @@ The build requires the Debian 13 `libsodium-dev` package matching runtime
 make
 make test
 make sanitize
+make deb TEST_TMPDIR=/path/to/private-scratch
+make deb-test TEST_TMPDIR=/path/to/private-scratch
 ```
 
 Packagers may override `SODIUM_CPPFLAGS` and `SODIUM_LDLIBS` when building
 against an unpacked, independently verified sysroot.
+`make deb` produces a reproducible, source-bound Debian package in `dist/` and
+refuses a dirty source tree. `make deb-test` additionally exercises dpkg
+install, upgrade, rollback, remove, reinstall, and purge in an isolated root;
+package removal and purge preserve user vault data.
 
 The administrative CLI includes `init`, `unlock`, `lock`, `passwd`, `add`,
 `show`, `grant`, `revoke`, `copy`, `run`, `list`, `delete`, `rotate`, `export`,

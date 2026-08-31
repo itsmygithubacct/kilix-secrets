@@ -34,7 +34,7 @@ LIB_DEPS := $(LIB_OBJECTS:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test sanitize fuzz install uninstall check-deps package-test
+.PHONY: all clean test sanitize fuzz install uninstall check-deps package-test deb deb-test
 
 all: $(BUILD)/libkilix-secrets.a $(BUILD)/libkilix-secrets.so.0 \
 	$(BUILD)/kilix-secretsd $(BUILD)/kilix-secrets $(BUILD)/kilix-secrets.pc
@@ -168,6 +168,12 @@ uninstall:
 package-test: all
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_package.py --build-dir $(BUILD)
+
+deb:
+	TMPDIR="$(TEST_TMPDIR)" packaging/build-deb.sh
+
+deb-test:
+	TMPDIR="$(TEST_TMPDIR)" packaging/test-deb.sh
 
 clean:
 	@case "$(abspath $(BUILD))" in \
