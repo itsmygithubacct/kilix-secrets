@@ -12,6 +12,10 @@ multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 source_epoch=$(git -C "$source_root" show -s --format=%ct HEAD)
 source_commit=$(git -C "$source_root" rev-parse 'HEAD^{commit}')
 source_tree=$(git -C "$source_root" rev-parse 'HEAD^{tree}')
+package_cflags=${CFLAGS:--O2 -g}
+package_cflags="$package_cflags -ffile-prefix-map=$source_root=."
+package_cflags="$package_cflags -fdebug-prefix-map=$source_root=."
+package_cflags="$package_cflags -fmacro-prefix-map=$source_root=."
 
 if test -n "$(git -C "$source_root" status --porcelain)" \
         && test "${ALLOW_DIRTY:-0}" != 1; then
@@ -43,8 +47,9 @@ build_dir=$source_root/build-deb
 mkdir -p "$package_root" "$output_dir"
 
 make -C "$source_root" clean BUILD="$build_dir"
-make -C "$source_root" all BUILD="$build_dir" PREFIX=/usr
-make -C "$source_root" install BUILD="$build_dir" PREFIX=/usr DESTDIR="$package_root"
+CFLAGS="$package_cflags" make -C "$source_root" all BUILD="$build_dir" PREFIX=/usr
+CFLAGS="$package_cflags" make -C "$source_root" install \
+    BUILD="$build_dir" PREFIX=/usr DESTDIR="$package_root"
 
 # Debian's native library directory is multiarch. The upstream Makefile keeps a
 # portable /usr/lib default, so move the package payload without changing local

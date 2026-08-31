@@ -4,6 +4,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source_root=$(cd "$here/.." && pwd)
 tmp_root=${TMPDIR:-/tmp}
 case "$tmp_root" in
     /*) ;;
@@ -22,7 +23,8 @@ trap cleanup EXIT HUP INT TERM
 
 version_a=0.1.0~package-test-1
 version_b=0.1.0~package-test-2
-mkdir -p "$scratch/a" "$scratch/a-rebuilt" "$scratch/b" "$scratch/root"
+mkdir -p "$scratch/a" "$scratch/a-rebuilt" "$scratch/b" \
+    "$scratch/cross" "$scratch/root"
 TMPDIR=$tmp_root OUTPUT_DIR=$scratch/a PACKAGE_VERSION=$version_a ALLOW_DIRTY=1 \
     "$here/build-deb.sh" >/dev/null
 TMPDIR=$tmp_root OUTPUT_DIR=$scratch/a-rebuilt PACKAGE_VERSION=$version_a ALLOW_DIRTY=1 \
@@ -31,6 +33,18 @@ package_a=$(find "$scratch/a" -maxdepth 1 -type f -name '*.deb' -print -quit)
 package_a_rebuilt=$(find "$scratch/a-rebuilt" -maxdepth 1 -type f -name '*.deb' -print -quit)
 test -n "$package_a" && test -n "$package_a_rebuilt"
 cmp "$package_a" "$package_a_rebuilt"
+
+cross_source=$scratch/source-copy
+git clone --quiet --no-hardlinks "$source_root" "$cross_source"
+(
+    cd "$source_root"
+    git ls-files -z | tar --null -T - -cf -
+) | tar -xf - -C "$cross_source"
+TMPDIR=$tmp_root OUTPUT_DIR=$scratch/cross PACKAGE_VERSION=$version_a ALLOW_DIRTY=1 \
+    "$cross_source/packaging/build-deb.sh" >/dev/null
+package_cross=$(find "$scratch/cross" -maxdepth 1 -type f -name '*.deb' -print -quit)
+test -n "$package_cross"
+cmp "$package_a" "$package_cross"
 
 test "$(dpkg-deb -f "$package_a" Package)" = kilix-secrets
 test "$(dpkg-deb -f "$package_a" Version)" = "$version_a"
@@ -83,7 +97,7 @@ cp "$scratch/root/usr/lib/systemd/user/kilix-secrets.socket" "$verify_dir/"
 systemd-analyze verify "$verify_dir/kilix-secrets.socket" \
     "$verify_dir/kilix-secrets.service"
 
-printf 'Debian package checks: 23/23 passed; reproducible builds: 2/2 identical\n'
+printf 'Debian package checks: 23/23 passed; reproducible builds: 3/3 identical across 2/2 checkout paths\n'
 
 # Exercise dpkg itself, not just archive extraction. There are deliberately no
 # maintainer scripts: package removal and purge must never traverse user homes.
