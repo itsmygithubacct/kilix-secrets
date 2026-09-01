@@ -1804,7 +1804,19 @@ static int create_listener(const char *socket_path) {
     size_t path_len;
     if (socket_path == NULL || socket_path[0] != '/') return -1;
     path_len = strlen(socket_path);
-    if (path_len >= sizeof address.sun_path || path_len >= sizeof directory) return -1;
+    if (path_len >= sizeof address.sun_path || path_len >= sizeof directory) {
+        /*
+         * AF_UNIX caps sun_path; past it there is no socket to create.
+         * Failing closed is right, but failing closed and silent left an
+         * operator on a long path with a bare exit and nothing to read.
+         */
+        errno = ENAMETOOLONG;
+        fprintf(stderr,
+                "kilix-secretsd: socket path is %zu bytes; the maximum is %zu "
+                "(AF_UNIX sun_path limit)\n",
+                path_len, sizeof address.sun_path - 1U);
+        return -1;
+    }
     memcpy(directory, socket_path, path_len + 1U);
     slash = strrchr(directory, '/');
     if (slash == NULL || slash == directory) return -1;

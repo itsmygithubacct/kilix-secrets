@@ -131,6 +131,28 @@ def overflow_is_closed(socket_path: Path) -> bool:
         descriptor.close()
 
 
+
+def check_over_long_socket_path_is_diagnosed(checks: "Checks", daemon: Path,
+                                            root: Path) -> None:
+    """SEC-02: past sun_path's limit the daemon must say why, not just exit."""
+    deep = root / ("d" * 60) / ("e" * 60) / ("f" * 60)
+    deep.mkdir(parents=True, exist_ok=True)
+    socket_path = deep / "control.sock"
+    data_dir = root / "sec02-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [str(daemon), "--socket", str(socket_path), "--data-dir", str(data_dir)],
+        capture_output=True, text=True, timeout=30)
+    checks.check(len(str(socket_path)) > 107,
+                 "the probe path exceeds the AF_UNIX sun_path limit")
+    checks.check(completed.returncode != 0,
+                 "an over-long socket path fails closed")
+    checks.check("socket path is" in completed.stderr
+                 and "maximum is 107" in completed.stderr,
+                 "an over-long socket path is diagnosed, not silent")
+    checks.check(not socket_path.exists(), "no socket is left behind")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", required=True)
@@ -144,6 +166,7 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="ksec-limits.", dir=scratch))
     runtime = root / "runtime"
     runtime.mkdir(mode=0o700)
+    check_over_long_socket_path_is_diagnosed(checks, daemon, root)
     socket_path = runtime / "kilix-secrets" / "control.sock"
     data_dir = root / "data"
     process: subprocess.Popen[bytes] | None = None

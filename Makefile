@@ -82,6 +82,12 @@ $(BUILD)/test-session: tests/test_session.c src/session.c src/session.h | $(BUIL
 	$(CC) $(CPPFLAGS) $(SYSTEMD_CPPFLAGS) $(CFLAGS) -DKSEC_TESTING \
 		$(LDFLAGS) -o $@ tests/test_session.c src/session.c $(SYSTEMD_LDLIBS)
 
+$(BUILD)/test-serve-guard: tests/test_serve_guard.c src/daemon.c src/session.c \
+		$(BUILD)/libkilix-secrets.a | $(BUILD)
+	$(CC) $(CPPFLAGS) $(SYSTEMD_CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ \
+		tests/test_serve_guard.c src/session.c $(BUILD)/libkilix-secrets.a \
+		$(LDLIBS) $(SYSTEMD_LDLIBS)
+
 $(BUILD)/identity-helper: tests/identity_helper.c $(BUILD)/libkilix-secrets.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
 		$(BUILD)/libkilix-secrets.a $(LDLIBS)
@@ -91,11 +97,12 @@ $(BUILD)/parser-harness: tests/parser_harness.c $(BUILD)/libkilix-secrets.a
 		$(BUILD)/libkilix-secrets.a $(LDLIBS)
 
 test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
-	$(BUILD)/test-session $(BUILD)/identity-helper $(BUILD)/generate-vectors \
+	$(BUILD)/test-serve-guard $(BUILD)/test-session $(BUILD)/identity-helper $(BUILD)/generate-vectors \
 	$(BUILD)/parser-harness
 	test -d "$(TEST_TMPDIR)" && test ! -L "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-unit
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-crash
+	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-serve-guard
 	$(BUILD)/generate-vectors | cmp - tests/vectors/full-v1.txt
 	$(BUILD)/test-vectors
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
