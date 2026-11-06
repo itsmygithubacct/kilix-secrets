@@ -915,6 +915,139 @@ static void test_policy(void) {
     sodium_memzero(token, sizeof token);
 }
 
+static void fill_argon_grid(ksec_argon_observation rows[KSEC_ARGON_GRID_COUNT]) {
+    static const uint32_t ops_values[KSEC_ARGON_OPS_COUNT] = {3U, 4U, 5U, 6U};
+    static const uint32_t mem_values[KSEC_ARGON_MEM_COUNT] = {256U, 384U, 512U};
+    size_t count = 0U;
+    size_t mem_index;
+    size_t ops_index;
+    for (mem_index = 0U; mem_index < KSEC_ARGON_MEM_COUNT; mem_index++) {
+        for (ops_index = 0U; ops_index < KSEC_ARGON_OPS_COUNT; ops_index++) {
+            ksec_argon_observation *row = &rows[count++];
+            row->ops = ops_values[ops_index];
+            row->mem_mib = mem_values[mem_index];
+            row->median_ms = (double)row->ops * 100.0 + (double)row->mem_mib / 10.0;
+            row->min_ms = row->median_ms - 10.0;
+            row->p95_ms = row->median_ms + 5.0;
+            row->max_ms = row->median_ms + 10.0;
+        }
+    }
+}
+
+static ksec_argon_observation *find_argon_row(ksec_argon_observation *rows,
+                                              uint32_t ops, uint32_t mem_mib) {
+    size_t index;
+    for (index = 0U; index < KSEC_ARGON_GRID_COUNT; index++) {
+        if (rows[index].ops == ops && rows[index].mem_mib == mem_mib) return &rows[index];
+    }
+    return NULL;
+}
+
+static void test_argon_selection(void) {
+    ksec_argon_observation rows[KSEC_ARGON_GRID_COUNT];
+    ksec_argon_observation shifted[KSEC_ARGON_GRID_COUNT];
+    uint32_t ops = 0U;
+    uint32_t mem_mib = 0U;
+    size_t index;
+    ksec_argon_observation *row;
+
+    fill_argon_grid(rows);
+    CHECK(ksec_argon_select_point(rows, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib) == KSEC_OK);
+    CHECK(ops == 6U && mem_mib == 512U);
+
+    memcpy(shifted, rows, sizeof shifted);
+    row = find_argon_row(shifted, 5U, 256U);
+    CHECK(row != NULL);
+    row->median_ms = find_argon_row(shifted, 4U, 256U)->median_ms - 1.0;
+    row->min_ms = row->median_ms - 10.0;
+    row->p95_ms = row->median_ms + 5.0;
+    row->max_ms = row->median_ms + 10.0;
+    CHECK(ksec_argon_select_point(shifted, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib)
+          == KSEC_ERR_INVALID);
+
+    memcpy(shifted, rows, sizeof shifted);
+    row = find_argon_row(shifted, 6U, 512U);
+    CHECK(row != NULL);
+    row->max_ms = KSEC_ARGON_CEILING_MS - KSEC_ARGON_MIN_HEADROOM_MS + 1.0;
+    row->p95_ms = row->max_ms;
+    row->median_ms = row->max_ms;
+    row->min_ms = row->max_ms;
+    CHECK(ksec_argon_select_point(shifted, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib) == KSEC_OK);
+    CHECK(ops == 5U && mem_mib == 512U);
+
+    memcpy(shifted, rows, sizeof shifted);
+    for (index = 0U; index < KSEC_ARGON_GRID_COUNT; index++) {
+        shifted[index].max_ms = KSEC_ARGON_CEILING_MS;
+        shifted[index].p95_ms = shifted[index].max_ms;
+    }
+    row = find_argon_row(shifted, 6U, 256U);
+    row->max_ms = 1000.0;
+    row->p95_ms = row->median_ms;
+    row = find_argon_row(shifted, 3U, 512U);
+    row->max_ms = 1100.0;
+    row->p95_ms = row->median_ms;
+    CHECK(ksec_argon_select_point(shifted, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib) == KSEC_OK);
+    CHECK(ops == 3U && mem_mib == 512U);
+
+    CHECK(ksec_argon_select_point(rows, KSEC_ARGON_GRID_COUNT - 1U, &ops, &mem_mib)
+          == KSEC_ERR_INVALID);
+    CHECK(ksec_argon_select_point(NULL, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib)
+          == KSEC_ERR_INVALID);
+    rows[0].max_ms = rows[0].min_ms - 1.0;
+    CHECK(ksec_argon_select_point(rows, KSEC_ARGON_GRID_COUNT, &ops, &mem_mib)
+          == KSEC_ERR_INVALID);
+}
+
+static void test_h0_record_selects_production_point(void) {
+    FILE *file = fopen("docs/H0-CALIBRATION.txt", "r");
+    ksec_argon_observation rows[KSEC_ARGON_GRID_COUNT];
+    char line[256];
+    size_t count = 0U;
+    unsigned monotonic = 0U;
+    uint32_t ops = 0U;
+    uint32_t mem_mib = 0U;
+    CHECK(file != NULL);
+    if (file == NULL) return;
+    while (fgets(line, sizeof line, file) != NULL) {
+        unsigned point_ops = 0U;
+        unsigned point_mem = 0U;
+        unsigned reported_mem = 0U;
+        double min_ms = 0.0;
+        double med_ms = 0.0;
+        double p95_ms = 0.0;
+        double max_ms = 0.0;
+        double spread = 0.0;
+        char verdict[16];
+        if (sscanf(line,
+                   "POINT ops=%u mem=%uMiB min=%lf med=%lf p95=%lf MAX=%lf spread=%lf",
+                   &point_ops, &point_mem, &min_ms, &med_ms, &p95_ms, &max_ms,
+                   &spread) == 7) {
+            CHECK(count < KSEC_ARGON_GRID_COUNT);
+            if (count < KSEC_ARGON_GRID_COUNT) {
+                rows[count].ops = point_ops;
+                rows[count].mem_mib = point_mem;
+                rows[count].min_ms = min_ms;
+                rows[count].median_ms = med_ms;
+                rows[count].p95_ms = p95_ms;
+                rows[count].max_ms = max_ms;
+                count++;
+            }
+            CHECK(spread >= 1.0);
+        } else if (sscanf(line, "MONOTONIC mem=%uMiB: %15s",
+                          &reported_mem, verdict) == 2) {
+            monotonic++;
+            CHECK(strcmp(verdict, "yes") == 0);
+            CHECK(reported_mem == 256U || reported_mem == 384U || reported_mem == 512U);
+        }
+    }
+    CHECK(fclose(file) == 0);
+    CHECK(count == KSEC_ARGON_GRID_COUNT);
+    CHECK(monotonic == KSEC_ARGON_MEM_COUNT);
+    CHECK(ksec_argon_select_point(rows, count, &ops, &mem_mib) == KSEC_OK);
+    CHECK(ops == KSEC_ARGON_OPS_PRODUCTION);
+    CHECK(mem_mib == KSEC_ARGON_MEM_PRODUCTION_MIB);
+}
+
 static void test_secure_memory_failure(void) {
     ksec_secure_buffer buffer = {0};
     ksec_test_force_mlock_failure(true);
@@ -939,6 +1072,8 @@ int main(void) {
     test_store();
     test_audit();
     test_policy();
+    test_argon_selection();
+    test_h0_record_selects_production_point();
     test_secure_memory_failure();
     sodium_memzero(fixture_master, sizeof fixture_master);
     sodium_memzero(&fixture_header, sizeof fixture_header);

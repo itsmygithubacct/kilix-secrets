@@ -1,0 +1,25 @@
+# H0 Argon2id calibration, 2026-11-06.
+# Guest: qemu-system-x86_64 -enable-kvm -machine q35 -cpu qemu64 -smp 2 -m 4096
+# Kernel: 6.12.115+deb13.1-amd64. libsodium 1.0.18 (Debian 1.0.18-1+deb13u1).
+# Harness: tools/h0-calibrate.c as PID 1. Warm-up discarded, 15 trials.
+# ksec_argon_select_point selects ops 4, 512 MiB (maximum 1734.0 ms).
+=== H0 ARGON2ID CALIBRATION (corrected method) ===
+libsodium 1.0.18 | warm-up discarded 3 | measured trials 15
+LOADAVG START: 0.00 0.00 0.00 2/59 138
+POINT ops=3 mem=256MiB min=561.8 med=596.3 p95=656.9 MAX=674.5 spread=1.20x
+POINT ops=4 mem=256MiB min=736.3 med=783.1 p95=803.9 MAX=855.7 spread=1.16x
+POINT ops=5 mem=256MiB min=929.5 med=956.4 p95=1080.7 MAX=1129.0 spread=1.21x
+POINT ops=6 mem=256MiB min=1136.5 med=1187.1 p95=1229.9 MAX=1238.3 spread=1.09x
+MONOTONIC mem=256MiB: yes (harness sound)
+POINT ops=3 mem=384MiB min=862.0 med=882.1 p95=960.4 MAX=965.2 spread=1.12x
+POINT ops=4 mem=384MiB min=1178.8 med=1286.4 p95=1738.4 MAX=1798.9 spread=1.53x
+POINT ops=5 mem=384MiB min=1397.7 med=1447.7 p95=1509.6 MAX=1586.8 spread=1.14x
+POINT ops=6 mem=384MiB min=1666.0 med=1750.7 p95=1929.8 MAX=1930.5 spread=1.16x
+MONOTONIC mem=384MiB: yes (harness sound)
+POINT ops=3 mem=512MiB min=1148.7 med=1191.4 p95=1281.2 MAX=1291.3 spread=1.12x
+POINT ops=4 mem=512MiB min=1522.3 med=1566.7 p95=1699.9 MAX=1734.0 spread=1.14x
+POINT ops=5 mem=512MiB min=1946.2 med=2074.7 p95=2234.4 MAX=2236.2 spread=1.15x
+POINT ops=6 mem=512MiB min=2273.2 med=2423.0 p95=2527.3 MAX=2572.3 spread=1.13x
+MONOTONIC mem=512MiB: yes (harness sound)
+LOADAVG END: 1.00 0.64 0.28 1/59 138
+=== CALIBRATION COMPLETE ===

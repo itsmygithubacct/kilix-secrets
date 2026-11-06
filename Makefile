@@ -23,6 +23,7 @@ LIB_SOURCES := \
 	src/memory.c \
 	src/format.c \
 	src/crypto.c \
+	src/kdf.c \
 	src/store.c \
 	src/policy.c \
 	src/audit.c \

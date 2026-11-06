@@ -34,6 +34,25 @@
 #define KSEC_ARGON_OPS_MAX 6U
 #define KSEC_ARGON_MEM_MIN (UINT64_C(256) * UINT64_C(1024) * UINT64_C(1024))
 #define KSEC_ARGON_MEM_MAX (UINT64_C(512) * UINT64_C(1024) * UINT64_C(1024))
+#define KSEC_ARGON_OPS_COUNT 4U
+#define KSEC_ARGON_MEM_COUNT 3U
+#define KSEC_ARGON_GRID_COUNT (KSEC_ARGON_OPS_COUNT * KSEC_ARGON_MEM_COUNT)
+#define KSEC_ARGON_CEILING_MS 2000.0
+#define KSEC_ARGON_MIN_HEADROOM_MS 100.0
+/* H0 record docs/H0-CALIBRATION.txt. Slowest trial 1734.0 ms. */
+#define KSEC_ARGON_OPS_PRODUCTION 4U
+#define KSEC_ARGON_MEM_PRODUCTION_MIB 512U
+#define KSEC_ARGON_MEM_PRODUCTION \
+    ((uint64_t)KSEC_ARGON_MEM_PRODUCTION_MIB * UINT64_C(1024) * UINT64_C(1024))
+
+typedef struct ksec_argon_observation {
+    uint32_t ops;
+    uint32_t mem_mib;
+    double min_ms;
+    double median_ms;
+    double p95_ms;
+    double max_ms;
+} ksec_argon_observation;
 
 #define KSEC_PROTOCOL_VERSION 1U
 #define KSEC_PROTOCOL_MAGIC UINT32_C(0x4b534543)
@@ -301,6 +320,8 @@ ksec_result ksec_format_slot_ad(const ksec_vault_header *header,
                                 const ksec_key_slot *slot, uint8_t *output,
                                 size_t output_size, size_t *output_length);
 
+ksec_result ksec_argon_select_point(const ksec_argon_observation *rows, size_t count,
+                                    uint32_t *ops_out, uint32_t *mem_mib_out);
 ksec_result ksec_crypto_initialize(void);
 ksec_result ksec_header_create(ksec_vault_header *header,
                                const uint8_t *passphrase, size_t passphrase_len,

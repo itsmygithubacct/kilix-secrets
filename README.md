@@ -11,9 +11,13 @@ OS / Kilix 0.2.1 F112. Design review A112 accepted the frozen design package;
 independent implementation Review B and shared-repository integration remain
 mandatory. No remote, push, tag, or publication is authorized.
 
-The production service intentionally has no development KDF flags. A final
-Argon2id point remains externally unselected until it is calibrated on the H0
-4 GiB target; initialization without that selection fails closed.
+The production daemon uses the H0 Argon2id point selected from
+`docs/H0-CALIBRATION.txt`: 4 operations and 512 MiB. That corner's slowest
+trial was 1734.0 ms, 266 ms under the 2000 ms ceiling. `doctor` reports
+`kdf_point=production:ops=4,mem=512MiB`. The development KDF flags remain for
+tests and mark the point `development`. The installed unit does not pass them.
+Every start has either that compiled-in point or a paired development
+override. Init and reset use the point configured for that process.
 
 ## Build
 

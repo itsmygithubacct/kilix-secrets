@@ -47,6 +47,7 @@ typedef struct {
     bool header_damaged;
     bool unlocked;
     bool kdf_configured;
+    bool kdf_development;
     uint32_t argon_ops;
     uint64_t argon_mem;
     uint32_t failed_unlocks;
@@ -1654,12 +1655,23 @@ out:
 static ksec_result handle_doctor(daemon_state *state, daemon_connection *connection,
                                  size_t payload_len, int received_fd, int *reply_fd) {
     char report[512];
+    char point[64];
     int count;
+    int point_count;
     ksec_result result;
     if (payload_len != 0U || received_fd >= 0) return KSEC_ERR_PROTOCOL;
     result = authorize(state, connection, KSEC_VERB_DOCTOR,
                        connection->capability->app_id, NULL);
     if (result != KSEC_OK) return result;
+    if (!state->kdf_configured) {
+        point_count = snprintf(point, sizeof point, "unselected");
+    } else {
+        point_count = snprintf(point, sizeof point, "%s:ops=%u,mem=%uMiB",
+                               state->kdf_development ? "development" : "production",
+                               state->argon_ops,
+                               (unsigned)(state->argon_mem / (UINT64_C(1024) * UINT64_C(1024))));
+    }
+    if (point_count < 0 || (size_t)point_count >= sizeof point) return KSEC_ERR_LIMIT;
     count = snprintf(report, sizeof report,
                      "format=1\ninitialized=%s\nstorage=%s\nstate=%s\nrecovery=%s\nkdf_point=%s\nrecords=%zu/%u\nidentity_leases=%zu/%u\ntorn_tail=%s\naudit=%s\nsession_monitor=active\ngraphical_sessions=%zu/%u\n",
                      state->initialized ? "yes" : "no",
@@ -1669,7 +1681,7 @@ static ksec_result handle_doctor(daemon_state *state, daemon_connection *connect
                          : !state->initialized ? "not-initialized"
                          : (state->header.flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) != 0U
                              ? "confirmed" : "confirmation-required",
-                     state->kdf_configured ? "development-configured" : "unselected",
+                     point,
                      state->unlocked ? state->store.record_count : 0U,
                      KSEC_MAX_RECORDS,
                      identity_lease_count(state), KSEC_MAX_IDENTITY_LEASES,
@@ -2051,6 +2063,9 @@ int main(int argc, char **argv) {
     state.store.lock_fd = -1;
     state.audit_fd = -1;
     state.idle_timeout = 900U;
+    state.argon_ops = KSEC_ARGON_OPS_PRODUCTION;
+    state.argon_mem = KSEC_ARGON_MEM_PRODUCTION;
+    state.kdf_configured = true;
     while ((option = getopt_long(argc, argv, "Ss:d:o:m:i:h", options, NULL)) != -1) {
         switch (option) {
             case 'S': systemd_mode = true; break;
@@ -2091,6 +2106,7 @@ int main(int argc, char **argv) {
             return 2;
         }
         state.kdf_configured = true;
+        state.kdf_development = true;
     }
     umask(0077);
     if (clearenv() != 0 || close_unneeded_descriptors(systemd_mode) != 0) return 1;
