@@ -6,10 +6,11 @@ values are encrypted in an authenticated append-only journal and are delivered
 to authorized consumers through descriptors, not command arguments or
 environment variables.
 
-This repository is an unqualified local implementation candidate for Plebian
-OS / Kilix 0.2.1 F112. Design review A112 accepted the frozen design package;
-independent implementation Review B and shared-repository integration remain
-mandatory. No remote, push, tag, or publication is authorized.
+This repository is the Plebian OS / Kilix F112 credential vault. Design review
+A112 accepted the frozen design package. Independent implementation Review B
+accepted the measured H0 production point in c7c5ebd. Publication of that
+history on this repository's main branch is authorized. A release tag is a
+separate act and is not authorized by this record.
 
 The production daemon uses the H0 Argon2id point selected from
 `docs/H0-CALIBRATION.txt`: 4 operations and 512 MiB. That corner's slowest
