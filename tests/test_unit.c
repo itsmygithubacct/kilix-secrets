@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1058,12 +1059,64 @@ static void test_secure_memory_failure(void) {
     ksec_secure_free(&buffer);
 }
 
+static int write_text(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    ssize_t wrote;
+    if (fd < 0) return -1;
+    wrote = write(fd, text, strlen(text));
+    close(fd);
+    return wrote == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+/* Inside a user namespace that maps only the caller, root-owned parents show
+ * the overflow uid. They are accepted when nobody else can write them, and a
+ * sticky world-writable parent is not. Outside, nothing changes. */
+static void test_unmapped_root_parents(void) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    char strict[4096], loose[4096], map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    struct stat status;
+    pid_t child;
+    int result = 0;
+    if (runtime == NULL || runtime[0] != '/'
+            || ksec_validate_secure_directory(runtime, true) != 0
+            || stat("/tmp", &status) != 0 || status.st_uid != 0U
+            || (status.st_mode & (S_ISVTX | 0002U)) != (S_ISVTX | 0002U)) {
+        printf("unmapped-root parents: skipped, no private runtime directory\n");
+        return;
+    }
+    snprintf(strict, sizeof strict, "%s/ksec-userns-XXXXXX", runtime);
+    snprintf(loose, sizeof loose, "/tmp/ksec-userns-XXXXXX");
+    CHECK(mkdtemp(strict) != NULL && mkdtemp(loose) != NULL);
+    CHECK(ksec_validate_secure_directory(strict, true) == 0);
+    CHECK(ksec_validate_secure_directory(loose, true) == 0);
+    child = fork();
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER) != 0) _exit(77);
+        snprintf(map, sizeof map, "%lu %lu 1", (unsigned long)uid, (unsigned long)uid);
+        if (write_text("/proc/self/uid_map", map) != 0) _exit(77);
+        if (write_text("/proc/self/setgroups", "deny") != 0) _exit(77);
+        snprintf(map, sizeof map, "%lu %lu 1", (unsigned long)gid, (unsigned long)gid);
+        if (write_text("/proc/self/gid_map", map) != 0) _exit(77);
+        if (stat("/", &status) != 0 || status.st_uid == 0U) _exit(77);
+        _exit((ksec_validate_secure_directory(strict, true) == 0 ? 0 : 1)
+              | (ksec_validate_secure_directory(loose, true) != 0 ? 0 : 2));
+    }
+    CHECK(child > 0 && waitpid(child, &result, 0) == child && WIFEXITED(result));
+    if (WEXITSTATUS(result) == 77) printf("unmapped-root parents: skipped, no user namespaces\n");
+    else CHECK(WEXITSTATUS(result) == 0);
+    rmdir(strict);
+    rmdir(loose);
+}
+
 int main(void) {
     if (ksec_crypto_initialize() != KSEC_OK) {
         fprintf(stderr, "libsodium initialization failed\n");
         return 1;
     }
     test_utilities();
+    test_unmapped_root_parents();
     test_nonblocking_predicate();
     test_ad_vectors();
     test_record_codec();

@@ -19,3 +19,8 @@
   stale-generation refusal, and 128/128 bounded pollable invalidation leases.
 - Bound mutation streaming to one 4,096-byte frame, add 65,536/65,536-case
   fuzz closure, and prove the 64/64 connection, one-thread and RSS ceilings.
+- Accept root-owned parent directories that report the kernel overflow uid
+  when the daemon runs in a user namespace with no mapping for root, as a
+  sandboxed systemd user service does. Such a parent must not be writable by
+  group or others; the sticky world-writable exception still needs a real
+  uid 0. Outside such a namespace the rule is unchanged.
