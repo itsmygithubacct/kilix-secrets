@@ -177,7 +177,8 @@ install: all
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib \
 		$(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig \
 		$(DESTDIR)$(PREFIX)/lib/systemd/user \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets
+		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets
 	install -m 0644 include/kilix_secrets.h $(DESTDIR)$(PREFIX)/include/
 	install -m 0644 $(BUILD)/libkilix-secrets.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 0755 $(BUILD)/libkilix-secrets.so.0 $(DESTDIR)$(PREFIX)/lib/
@@ -189,6 +190,13 @@ install: all
 	install -m 0644 LICENSE THIRD_PARTY_NOTICES.md docs/DEPENDENCIES.md \
 		docs/F113-CUSTODY-INTERFACE.md \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/
+	install -m 0644 python/kilix_secrets/__init__.py \
+		python/kilix_secrets/_binding.py \
+		python/kilix_secrets/_files.py \
+		python/kilix_secrets/_protocol.py \
+		python/kilix_secrets/_session.py \
+		python/kilix_secrets/worker.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/kilix_secrets.h \
@@ -203,7 +211,16 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/LICENSE \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/THIRD_PARTY_NOTICES.md \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/DEPENDENCIES.md \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md
+		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/__init__.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_binding.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_files.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_protocol.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_session.py \
+		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/worker.py
+	-rmdir $(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets
+	-rmdir $(DESTDIR)$(PREFIX)/lib/python3/dist-packages
+	-rmdir $(DESTDIR)$(PREFIX)/lib/python3
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/kilix-secrets
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc
 	-rmdir $(DESTDIR)$(PREFIX)/share
