@@ -593,9 +593,13 @@ def main() -> int:
         seen = read_until(crash, b"SENDING\n", 180.0)
         killed = False
         if b"SENDING\n" in seen:
-            delay = min(max(seal_elapsed * 0.45, 0.05), max(seal_elapsed - 0.05, 0.05))
-            time.sleep(delay)
-            os.kill(daemon_pid, signal.SIGKILL)
+            # SENDING is printed before the client reads the 64 MiB input.
+            # Kill immediately so the daemon dies before the reply is copied.
+            time.sleep(0.01)
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=10)
             killed = True
         crash_code = crash.wait(timeout=180)
