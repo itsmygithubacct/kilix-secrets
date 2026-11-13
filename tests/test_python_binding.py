@@ -94,6 +94,112 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def _needed_sonames(library: Path) -> set[str]:
+    """Dynamic NEEDED sonames. Falls back to a byte search if readelf is absent."""
+    try:
+        completed = subprocess.run(
+            ["readelf", "-d", str(library)],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        names: set[str] = set()
+        for line in completed.stdout.splitlines():
+            if "NEEDED" not in line:
+                continue
+            start = line.find("[")
+            end = line.rfind("]")
+            if start >= 0 and end > start:
+                names.add(line[start + 1:end])
+        return names
+    blob = library.read_bytes()
+    return {
+        name.decode("ascii")
+        for name in (b"libasan.so", b"libubsan.so")
+        if name in blob
+    }
+
+
+def _compiler_runtime(filename: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["cc", f"-print-file-name={filename}"],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    path = completed.stdout.strip()
+    if completed.returncode != 0 or not path or path == filename:
+        return None
+    if not Path(path).is_file():
+        return None
+    return path
+
+
+def _runtime_loaded(soname_prefix: str) -> bool:
+    try:
+        maps = Path("/proc/self/maps").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    return soname_prefix in maps
+
+
+def _with_leak_detection_off(options: str) -> str:
+    parts = [part for part in options.split(":") if part]
+    if any(part.split("=", 1)[0] == "detect_leaks" for part in parts):
+        return ":".join(parts)
+    parts.append("detect_leaks=0")
+    return ":".join(parts)
+
+
+def _delegate_sanitizer_preload(library: Path, argv: list[str]) -> int | None:
+    """Run the checks in a child when the library was built with ASan.
+
+    An instrumented ``libkilix-secrets.so.0`` aborts if ctypes loads it into
+    a CPython that did not load ``libasan`` first. Leak detection stays off
+    because CPython leaks at exit; every other sanitizer check stays on.
+    Returns the child status, or None when this process should run the checks.
+    """
+    if not library.is_file() or _runtime_loaded("libasan.so"):
+        return None
+    needed = _needed_sonames(library)
+    if not any(name == "libasan.so" or name.startswith("libasan.so.") for name in needed):
+        return None
+    preload: list[str] = []
+    asan = _compiler_runtime("libasan.so")
+    if asan is None:
+        print("libasan.so was not found", file=sys.stderr)
+        return 2
+    preload.append(asan)
+    if any(name == "libubsan.so" or name.startswith("libubsan.so.") for name in needed):
+        ubsan = _compiler_runtime("libubsan.so")
+        if ubsan is None:
+            print("libubsan.so was not found", file=sys.stderr)
+            return 2
+        preload.append(ubsan)
+    env = os.environ.copy()
+    existing = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = ":".join(preload + ([existing] if existing else []))
+    env["ASAN_OPTIONS"] = _with_leak_detection_off(env.get("ASAN_OPTIONS", ""))
+    completed = subprocess.run([sys.executable, *argv], env=env)
+    return int(completed.returncode)
+
+
+def _process_environment(pid: int) -> dict[str, str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    parsed: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        parsed[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return parsed
+
+
 def wait_for_socket(socket_path: Path, process: subprocess.Popen[bytes]) -> bool:
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -414,6 +520,13 @@ def test_worker(checks: Checks, socket_path: Path) -> None:
     worker = Worker()
     worker.start(str(socket_path), APP, Verb.ALL, 30, None)
     try:
+        worker_env = _process_environment(worker.pid or 0)
+        checks.check(
+            worker_env is not None
+            and worker_env.get("LD_PRELOAD", "") == os.environ.get("LD_PRELOAD", "")
+            and worker_env.get("ASAN_OPTIONS", "") == os.environ.get("ASAN_OPTIONS", ""),
+            "worker inherits LD_PRELOAD and ASAN_OPTIONS",
+        )
         refused, fds = worker.request("nope", {}, [])
         close_fds(fds)
         checks.check(refused.get("ok") is False and refused.get("code") == 5
@@ -558,14 +671,18 @@ def test_vault(checks: Checks, socket_path: Path) -> None:
         expect(checks, Invalid, "invalid input", lambda: session.unlock(9, PASS_V1))
         expect(checks, CryptoError, "authentication failure",
                lambda: session.unlock(Slot.RECOVERY, b"ab" * 32))
+        # The first backoff is one second. A development KDF can finish on
+        # either side of it. Exactly one of these checks runs, so the count
+        # does not depend on that race.
         try:
             session.unlock(Slot.RECOVERY, bytes(recovery))
         except Busy as exc:
-            # The first backoff is one second. A development KDF can outlast it.
             checks.check(str(exc) == "busy" and exc.code == 10,
                          "unlock during backoff is busy")
             time.sleep(1.2)
             session.unlock(Slot.RECOVERY, bytes(recovery))
+        else:
+            checks.check(True, "recovery unlock is accepted")
         expect(checks, Exists, "already exists", lambda: session.vault_init(PASS_V1))
         expect(checks, Exists, "already exists",
                lambda: session.unlock(Slot.PASSPHRASE, PASS_V1))
@@ -850,6 +967,9 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv[1:])
     build = Path(options.build_dir).resolve()
     library = build / "libkilix-secrets.so.0"
+    delegated = _delegate_sanitizer_preload(library, argv)
+    if delegated is not None:
+        return delegated
     os.environ["KILIX_SECRETS_LIBRARY"] = str(library)
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     sys.path.insert(0, str(PACKAGE_PARENT))
