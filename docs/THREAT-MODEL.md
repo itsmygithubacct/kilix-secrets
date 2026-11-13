@@ -108,11 +108,15 @@ it permanently unreadable.
 Each SEAL or UNSEAL reply is a memfd of up to about 64 MiB that lives in the
 socket queue until the client reads it. The daemon refuses SEAL and UNSEAL with
 `KSEC_ERR_BUSY` while the requesting connection still has an unread reply, so
-unread dataset replies are bounded at one per connection: 64 x about 64 MiB,
-roughly 4 GiB of shared memory charged to the daemon's cgroup in the worst
-case. That memory is shared memory, not daemon RSS, so the 8,192 KiB RSS bound
-above does not cover it. A same-UID process can exhaust tmpfs on its own, so
-this is a resource bound, not a privilege boundary.
+*unread* dataset replies are bounded at one per connection: 64 x about 64 MiB,
+roughly 4 GiB in the worst case. A reply the client has read belongs to the
+client, but its pages were faulted in by the daemon and stay charged to the
+daemon's memory cgroup until the client closes the descriptor; a client that
+reads each reply and keeps it is bounded only by its own descriptor limit.
+All of this is shared memory, not daemon RSS, so the 8,192 KiB RSS bound above
+does not cover it. A same-UID process can exhaust tmpfs on its own, so these are
+resource bounds, not a privilege boundary; a `MemoryMax=` on the daemon's unit
+would count delivered replies the client still holds.
 
 A daemon built before this amendment refuses to load a vault that contains a
 dataset key. That is fail-closed: no record is removed or rewritten, and the

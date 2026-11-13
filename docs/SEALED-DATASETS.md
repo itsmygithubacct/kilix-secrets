@@ -337,7 +337,9 @@ B-3 and B-5). Neither changes the file format, the vectors or operations
    `KSEC_ERR_BUSY` while the requesting connection has an unread reply
    (`ioctl(SIOCOUTQ)` greater than zero), checked right after the descriptor is
    found present. Unread dataset replies are therefore bounded at one per
-   connection, 64 in total.
+   connection, 64 in total. Replies the client has read and kept are the
+   client's descriptors, bounded only by its descriptor limit, and stay charged
+   to the daemon's memory cgroup until closed (review round 2, B2-1).
 2. **Partial output (B-5).** The client cannot take back bytes already written
    to a pipe or a full disk, so a write failure after `KSEC_OK` may leave a
    prefix in `output_fd`. The call still returns `KSEC_ERR_IO`.
