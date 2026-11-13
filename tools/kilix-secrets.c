@@ -32,13 +32,19 @@ static void usage(FILE *stream) {
             "  unlock [--recovery] [--secret-fd N]\n"
             "  lock\n"
             "  passwd [--secret-fd N]\n"
-            "  add --type TYPE --label LABEL --field NAME [--secret-fd N]\n"
+            "  add --type TYPE --label LABEL --field NAME [--secret-fd N] [--raw]\n"
+            "  replace RECORD --field NAME [--secret-fd N] [--raw]\n"
+            "  get RECORD FIELD (--output FILE | --output-fd N)\n"
             "  show RECORD\n"
             "  grant RECORD APP --verbs read,use[,replace,delete,list-own]\n"
             "  revoke RECORD APP\n"
             "  copy RECORD FIELD [--clear-seconds N]\n"
             "  run RECORD FIELD -- COMMAND [ARG ...]\n"
             "  list\n"
+            "  dataset-create --label LABEL\n"
+            "  seal RECORD --name NAME --revision N --input FILE|- --output FILE|-\n"
+            "  unseal RECORD --name NAME --input FILE|- --output FILE|-\n"
+            "  status\n"
             "  delete RECORD --confirm RECORD\n"
             "  rotate [--passphrase-fd N] [--recovery-fd N]\n"
             "  export --output FILE [--secret-fd N]\n"
@@ -58,6 +64,17 @@ static int parse_fd(const char *text, int *out) {
         return -1;
     }
     *out = (int)value;
+    return 0;
+}
+
+static int parse_u64(const char *text, uint64_t *out) {
+    char *end = NULL;
+    unsigned long long value;
+    if (text == NULL || out == NULL || text[0] < '0' || text[0] > '9') return -1;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') return -1;
+    *out = (uint64_t)value;
     return 0;
 }
 
@@ -154,8 +171,14 @@ fail:
 
 static uint32_t command_verbs(const char *command) {
     if (strcmp(command, "init") == 0) return KSEC_VERB_CREATE | KSEC_VERB_READ;
-    if (strcmp(command, "add") == 0) return KSEC_VERB_CREATE;
+    if (strcmp(command, "add") == 0 || strcmp(command, "dataset-create") == 0) {
+        return KSEC_VERB_CREATE;
+    }
     if (strcmp(command, "unlock") == 0 || strcmp(command, "lock") == 0) return KSEC_VERB_READ;
+    if (strcmp(command, "status") == 0) return KSEC_VERB_READ;
+    if (strcmp(command, "seal") == 0 || strcmp(command, "unseal") == 0) return KSEC_VERB_USE;
+    if (strcmp(command, "get") == 0) return KSEC_VERB_READ | KSEC_VERB_USE;
+    if (strcmp(command, "replace") == 0) return KSEC_VERB_REPLACE | KSEC_VERB_LIST_OWN;
     if (strcmp(command, "passwd") == 0) return KSEC_VERB_REPLACE;
     if (strcmp(command, "run") == 0) return KSEC_VERB_USE;
     if (strcmp(command, "copy") == 0) return KSEC_VERB_USE;
@@ -472,10 +495,682 @@ out:
     return result;
 }
 
+enum {
+    CLI_FAIL_NONE = 0,
+    CLI_FAIL_USAGE = 1,
+    CLI_FAIL_TERMINAL = 2
+};
+
+static int assign_text(char *destination, size_t destination_size,
+                       const char *value, size_t value_length) {
+    if (destination == NULL || value == NULL || value_length == 0U
+            || value_length >= destination_size) return -1;
+    memcpy(destination, value, value_length);
+    destination[value_length] = '\0';
+    return 0;
+}
+
+/* 1 when fd is a terminal, 0 when it is not, -1 when the check itself fails. */
+static int terminal_status(int fd) {
+    int result;
+    if (fd < 0) return -1;
+    errno = 0;
+    result = isatty(fd);
+    if (result == 1) return 1;
+    if (errno == EBADF) return -1;
+    return 0;
+}
+
+static ksec_result read_secret_fd(int fd, bool keep_trailing,
+                                  ksec_secure_buffer *value, size_t *secret_len) {
+    size_t length = 0U;
+    ksec_result result;
+    if (fd < 0 || value == NULL || value->data != NULL || secret_len == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_secure_alloc(value, KSEC_MAX_SECRET_BYTES);
+    if (result != KSEC_OK) return result;
+    for (;;) {
+        ssize_t count = read(fd, value->data + length, value->len - length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            ksec_secure_free(value);
+            return KSEC_ERR_IO;
+        }
+        if (count == 0) break;
+        length += (size_t)count;
+        if (length == value->len) {
+            uint8_t extra;
+            do {
+                count = read(fd, &extra, 1U);
+            } while (count < 0 && errno == EINTR);
+            sodium_memzero(&extra, sizeof extra);
+            if (count < 0) {
+                ksec_secure_free(value);
+                return KSEC_ERR_IO;
+            }
+            if (count != 0) {
+                ksec_secure_free(value);
+                return KSEC_ERR_LIMIT;
+            }
+            break;
+        }
+    }
+    if (!keep_trailing) {
+        size_t end = length;
+        while (length > 0U && (value->data[length - 1U] == (uint8_t)'\n'
+                || value->data[length - 1U] == (uint8_t)'\r')) {
+            length--;
+        }
+        if (length < end) sodium_memzero(value->data + length, end - length);
+    }
+    if (length == 0U) {
+        ksec_secure_free(value);
+        return KSEC_ERR_INVALID;
+    }
+    /* value->len stays the allocation size so ksec_secure_free unlocks it all. */
+    *secret_len = length;
+    return KSEC_OK;
+}
+
+static ksec_result write_record_id(const uint8_t record_id[KSEC_RECORD_ID_BYTES]) {
+    char id_hex[KSEC_RECORD_ID_BYTES * 2U + 1U];
+    char line[KSEC_RECORD_ID_BYTES * 2U + 2U];
+    ksec_hex_encode(record_id, KSEC_RECORD_ID_BYTES, id_hex);
+    memcpy(line, id_hex, KSEC_RECORD_ID_BYTES * 2U);
+    line[KSEC_RECORD_ID_BYTES * 2U] = '\n';
+    if (ksec_write_all(STDOUT_FILENO, line, KSEC_RECORD_ID_BYTES * 2U + 1U) != 0) {
+        sodium_memzero(line, sizeof line);
+        sodium_memzero(id_hex, sizeof id_hex);
+        return KSEC_ERR_IO;
+    }
+    sodium_memzero(line, sizeof line);
+    sodium_memzero(id_hex, sizeof id_hex);
+    return KSEC_OK;
+}
+
+static int open_input_path(const char *path, int *fd, bool *owned) {
+    if (path == NULL || path[0] == '\0' || fd == NULL || owned == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(path, "-") == 0) {
+        *fd = STDIN_FILENO;
+        *owned = false;
+        return 0;
+    }
+    *fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (*fd < 0) return -1;
+    *owned = true;
+    return 0;
+}
+
+static int open_exclusive_output(const char *path, int *fd, bool *owned,
+                                 bool *created) {
+    if (path == NULL || path[0] == '\0' || fd == NULL || owned == NULL
+            || created == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(path, "-") == 0) {
+        *fd = STDOUT_FILENO;
+        *owned = false;
+        *created = false;
+        return 0;
+    }
+    *fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (*fd < 0) return -1;
+    if (fchmod(*fd, 0600) != 0) {
+        int saved = errno;
+        unlink_exact_created_file(path, *fd);
+        (void)close(*fd);
+        *fd = -1;
+        errno = saved;
+        return -1;
+    }
+    *owned = true;
+    *created = true;
+    return 0;
+}
+
+static ksec_result load_show_metadata(ksec_client *client,
+                                      const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                                      char owner[KSEC_MAX_APP_ID + 1U],
+                                      char type[KSEC_MAX_TYPE + 1U],
+                                      char label[KSEC_MAX_LABEL + 1U],
+                                      uint64_t *expires_at) {
+    char buffer[8192];
+    size_t length = 0U;
+    size_t cursor = 0U;
+    bool saw_owner = false;
+    bool saw_type = false;
+    bool saw_label = false;
+    bool saw_expiry = false;
+    int fd = -1;
+    ksec_result result;
+    memset(buffer, 0, sizeof buffer);
+    if (owner != NULL) owner[0] = '\0';
+    if (type != NULL) type[0] = '\0';
+    if (label != NULL) label[0] = '\0';
+    if (client == NULL || record_id == NULL || owner == NULL || type == NULL
+            || label == NULL || expires_at == NULL) return KSEC_ERR_INVALID;
+    fd = memfd_create("ksec-cli-show", MFD_CLOEXEC);
+    if (fd < 0) return KSEC_ERR_IO;
+    result = ksec_show_to_fd(client, record_id, fd);
+    if (result != KSEC_OK) goto out;
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    for (;;) {
+        ssize_t count;
+        if (length == sizeof buffer) {
+            result = KSEC_ERR_LIMIT;
+            goto out;
+        }
+        count = read(fd, buffer + length, sizeof buffer - length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            result = KSEC_ERR_IO;
+            goto out;
+        }
+        if (count == 0) break;
+        length += (size_t)count;
+    }
+    if (length == 0U) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    while (cursor < length) {
+        size_t end = cursor;
+        size_t equals = 0U;
+        bool found_equals = false;
+        size_t key_len;
+        const char *value;
+        size_t value_len;
+        while (end < length && buffer[end] != '\n') {
+            if (buffer[end] == '\0' || buffer[end] == '\r') {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            if (!found_equals && buffer[end] == '=') {
+                equals = end;
+                found_equals = true;
+            }
+            end++;
+        }
+        if (end == length || !found_equals || equals == cursor) {
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+        key_len = equals - cursor;
+        value = buffer + equals + 1U;
+        value_len = end - (equals + 1U);
+        if (key_len == 5U && memcmp(buffer + cursor, "owner", 5) == 0) {
+            if (saw_owner
+                    || assign_text(owner, KSEC_MAX_APP_ID + 1U, value, value_len) != 0) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            saw_owner = true;
+        } else if (key_len == 4U && memcmp(buffer + cursor, "type", 4) == 0) {
+            if (saw_type
+                    || assign_text(type, KSEC_MAX_TYPE + 1U, value, value_len) != 0) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            saw_type = true;
+        } else if (key_len == 5U && memcmp(buffer + cursor, "label", 5) == 0) {
+            if (saw_label
+                    || assign_text(label, KSEC_MAX_LABEL + 1U, value, value_len) != 0) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            saw_label = true;
+        } else if (key_len == 10U && memcmp(buffer + cursor, "expires_at", 10) == 0) {
+            char text[32];
+            if (saw_expiry || value_len == 0U || value_len >= sizeof text) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            memcpy(text, value, value_len);
+            text[value_len] = '\0';
+            if (parse_u64(text, expires_at) != 0) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            sodium_memzero(text, sizeof text);
+            saw_expiry = true;
+        }
+        cursor = end + 1U;
+    }
+    if (!saw_owner || !saw_type || !saw_label || !saw_expiry
+            || ksec_validate_app_id(owner) != 0
+            || ksec_validate_name(type, KSEC_MAX_TYPE) != 0
+            || ksec_validate_name(label, KSEC_MAX_LABEL) != 0) {
+        result = KSEC_ERR_INVALID;
+    }
+out:
+    if (fd >= 0) (void)close(fd);
+    sodium_memzero(buffer, sizeof buffer);
+    if (result != KSEC_OK) {
+        sodium_memzero(owner, KSEC_MAX_APP_ID + 1U);
+        sodium_memzero(type, KSEC_MAX_TYPE + 1U);
+        sodium_memzero(label, KSEC_MAX_LABEL + 1U);
+        *expires_at = 0U;
+    }
+    return result;
+}
+
+static ksec_result command_add(const cli_request *request, ksec_client *client,
+                               int *failure) {
+    const char *type = NULL;
+    const char *label = NULL;
+    const char *field_name = NULL;
+    int secret_fd = -1;
+    bool raw = false;
+    bool saw_secret_fd = false;
+    int index;
+    ksec_secure_buffer value = {0};
+    size_t secret_len = 0U;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    ksec_result result = KSEC_OK;
+    memset(record_id, 0, sizeof record_id);
+    for (index = 1; index < request->argc; index++) {
+        if (index + 1 < request->argc && strcmp(request->argv[index], "--type") == 0
+                && type == NULL) {
+            type = request->argv[++index];
+        } else if (index + 1 < request->argc
+                && strcmp(request->argv[index], "--label") == 0 && label == NULL) {
+            label = request->argv[++index];
+        } else if (index + 1 < request->argc
+                && strcmp(request->argv[index], "--field") == 0 && field_name == NULL) {
+            field_name = request->argv[++index];
+        } else if (index + 1 < request->argc
+                && strcmp(request->argv[index], "--secret-fd") == 0
+                && !saw_secret_fd) {
+            saw_secret_fd = true;
+            if (parse_fd(request->argv[++index], &secret_fd) != 0) {
+                *failure = CLI_FAIL_USAGE;
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+        } else if (strcmp(request->argv[index], "--raw") == 0 && !raw) {
+            raw = true;
+        } else {
+            *failure = CLI_FAIL_USAGE;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    if (type == NULL || label == NULL || field_name == NULL) {
+        *failure = CLI_FAIL_USAGE;
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (ksec_validate_name(type, KSEC_MAX_TYPE) != 0
+            || ksec_validate_name(label, KSEC_MAX_LABEL) != 0
+            || ksec_validate_name(field_name, KSEC_MAX_FIELD_NAME) != 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (!saw_secret_fd) secret_fd = prompt_secret_fd("Secret value: ", 1U);
+    if (secret_fd < 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    result = read_secret_fd(secret_fd, raw, &value, &secret_len);
+    if (result != KSEC_OK) goto out;
+    {
+        ksec_field field = {field_name, value.data, secret_len};
+        ksec_record record = {
+            request->app_id, type, label, 0U, &field, 1U, NULL, 0U
+        };
+        result = ksec_put(client, &record, record_id);
+    }
+    if (result == KSEC_OK) result = write_record_id(record_id);
+out:
+    if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
+    ksec_secure_free(&value);
+    sodium_memzero(record_id, sizeof record_id);
+    return result;
+}
+
+static ksec_result command_replace(const cli_request *request, ksec_client *client,
+                                   int *failure) {
+    const char *record_text = NULL;
+    const char *field_name = NULL;
+    int secret_fd = -1;
+    bool raw = false;
+    bool saw_secret_fd = false;
+    int index;
+    char owner[KSEC_MAX_APP_ID + 1U];
+    char type[KSEC_MAX_TYPE + 1U];
+    char label[KSEC_MAX_LABEL + 1U];
+    uint64_t expires_at = 0U;
+    ksec_secure_buffer value = {0};
+    size_t secret_len = 0U;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    ksec_result result = KSEC_OK;
+    memset(owner, 0, sizeof owner);
+    memset(type, 0, sizeof type);
+    memset(label, 0, sizeof label);
+    memset(record_id, 0, sizeof record_id);
+    for (index = 1; index < request->argc; index++) {
+        const char *arg = request->argv[index];
+        if (index + 1 < request->argc && strcmp(arg, "--field") == 0
+                && field_name == NULL) {
+            field_name = request->argv[++index];
+        } else if (index + 1 < request->argc && strcmp(arg, "--secret-fd") == 0
+                && !saw_secret_fd) {
+            saw_secret_fd = true;
+            if (parse_fd(request->argv[++index], &secret_fd) != 0) {
+                *failure = CLI_FAIL_USAGE;
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+        } else if (strcmp(arg, "--raw") == 0 && !raw) {
+            raw = true;
+        } else if (record_text == NULL && arg[0] != '-') {
+            record_text = arg;
+        } else {
+            *failure = CLI_FAIL_USAGE;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    if (record_text == NULL || field_name == NULL) {
+        *failure = CLI_FAIL_USAGE;
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (ksec_hex_decode(record_text, record_id, sizeof record_id) != 0
+            || ksec_validate_name(field_name, KSEC_MAX_FIELD_NAME) != 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    result = load_show_metadata(client, record_id, owner, type, label, &expires_at);
+    if (result != KSEC_OK) goto out;
+    if (!saw_secret_fd) secret_fd = prompt_secret_fd("Secret value: ", 1U);
+    if (secret_fd < 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    result = read_secret_fd(secret_fd, raw, &value, &secret_len);
+    if (result != KSEC_OK) goto out;
+    {
+        ksec_field field = {field_name, value.data, secret_len};
+        ksec_record record = {
+            owner, type, label, expires_at, &field, 1U, NULL, 0U
+        };
+        result = ksec_replace(client, record_id, &record);
+    }
+out:
+    if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
+    ksec_secure_free(&value);
+    sodium_memzero(owner, sizeof owner);
+    sodium_memzero(type, sizeof type);
+    sodium_memzero(label, sizeof label);
+    sodium_memzero(record_id, sizeof record_id);
+    return result;
+}
+
+static ksec_result command_get(const cli_request *request, ksec_client *client,
+                               int *failure) {
+    const char *record_text = NULL;
+    const char *field_name = NULL;
+    const char *output_path = NULL;
+    int output_fd = -1;
+    bool saw_output_fd = false;
+    bool output_owned = false;
+    bool output_created = false;
+    int index;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    ksec_result result = KSEC_OK;
+    memset(record_id, 0, sizeof record_id);
+    for (index = 1; index < request->argc; index++) {
+        const char *arg = request->argv[index];
+        if (index + 1 < request->argc && strcmp(arg, "--output") == 0
+                && output_path == NULL && !saw_output_fd) {
+            output_path = request->argv[++index];
+        } else if (index + 1 < request->argc && strcmp(arg, "--output-fd") == 0
+                && !saw_output_fd && output_path == NULL) {
+            saw_output_fd = true;
+            if (parse_fd(request->argv[++index], &output_fd) != 0) {
+                *failure = CLI_FAIL_USAGE;
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+        } else if (arg[0] != '-' && record_text == NULL) {
+            record_text = arg;
+        } else if (arg[0] != '-' && field_name == NULL) {
+            field_name = arg;
+        } else {
+            *failure = CLI_FAIL_USAGE;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    if (record_text == NULL || field_name == NULL
+            || (output_path == NULL && !saw_output_fd)) {
+        *failure = CLI_FAIL_USAGE;
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (output_path != NULL
+            && (output_path[0] == '\0' || strcmp(output_path, "-") == 0)) {
+        *failure = CLI_FAIL_USAGE;
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (ksec_hex_decode(record_text, record_id, sizeof record_id) != 0
+            || ksec_validate_name(field_name, KSEC_MAX_FIELD_NAME) != 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (output_path != NULL) {
+        if (open_exclusive_output(output_path, &output_fd, &output_owned,
+                                  &output_created) != 0) {
+            result = errno == EEXIST ? KSEC_ERR_EXISTS : KSEC_ERR_IO;
+            goto out;
+        }
+    }
+    {
+        int tty = terminal_status(output_fd);
+        if (tty < 0) {
+            result = KSEC_ERR_IO;
+            goto out;
+        }
+        if (tty == 1) {
+            *failure = CLI_FAIL_TERMINAL;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    /* The library writes output_fd only after the daemon returns KSEC_OK. */
+    result = ksec_get_to_fd(client, record_id, field_name, output_fd);
+out:
+    if (result != KSEC_OK && output_created) {
+        unlink_exact_created_file(output_path, output_fd);
+    }
+    if (output_owned && output_fd >= 0 && close(output_fd) != 0 && result == KSEC_OK) {
+        result = KSEC_ERR_IO;
+    }
+    sodium_memzero(record_id, sizeof record_id);
+    return result;
+}
+
+static ksec_result command_dataset_create(const cli_request *request,
+                                          ksec_client *client, int *failure) {
+    const char *label = NULL;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    int index;
+    ksec_result result;
+    memset(record_id, 0, sizeof record_id);
+    for (index = 1; index < request->argc; index++) {
+        if (index + 1 < request->argc && strcmp(request->argv[index], "--label") == 0
+                && label == NULL) {
+            label = request->argv[++index];
+        } else {
+            *failure = CLI_FAIL_USAGE;
+            sodium_memzero(record_id, sizeof record_id);
+            return KSEC_ERR_INVALID;
+        }
+    }
+    if (label == NULL) {
+        *failure = CLI_FAIL_USAGE;
+        sodium_memzero(record_id, sizeof record_id);
+        return KSEC_ERR_INVALID;
+    }
+    if (ksec_validate_name(label, KSEC_MAX_LABEL) != 0) {
+        sodium_memzero(record_id, sizeof record_id);
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_dataset_create(client, label, record_id);
+    if (result == KSEC_OK) result = write_record_id(record_id);
+    sodium_memzero(record_id, sizeof record_id);
+    return result;
+}
+
+static ksec_result write_revision_line(uint64_t revision) {
+    char line[64];
+    int written = snprintf(line, sizeof line, "revision=%llu\n",
+                           (unsigned long long)revision);
+    if (written < 0 || (size_t)written >= sizeof line
+            || ksec_write_all(STDERR_FILENO, line, (size_t)written) != 0) {
+        return KSEC_ERR_IO;
+    }
+    return KSEC_OK;
+}
+
+static ksec_result command_seal(const cli_request *request, ksec_client *client,
+                                int *failure, bool unseal) {
+    const char *record_text = NULL;
+    const char *name = NULL;
+    const char *revision_text = NULL;
+    const char *input_path = NULL;
+    const char *output_path = NULL;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    uint64_t revision = 0U;
+    int input_fd = -1;
+    int output_fd = -1;
+    bool input_owned = false;
+    bool output_owned = false;
+    bool output_created = false;
+    int index;
+    ksec_result result = KSEC_OK;
+    memset(record_id, 0, sizeof record_id);
+    for (index = 1; index < request->argc; index++) {
+        const char *arg = request->argv[index];
+        if (index + 1 < request->argc && strcmp(arg, "--name") == 0 && name == NULL) {
+            name = request->argv[++index];
+        } else if (!unseal && index + 1 < request->argc
+                && strcmp(arg, "--revision") == 0 && revision_text == NULL) {
+            revision_text = request->argv[++index];
+        } else if (index + 1 < request->argc && strcmp(arg, "--input") == 0
+                && input_path == NULL) {
+            input_path = request->argv[++index];
+        } else if (index + 1 < request->argc && strcmp(arg, "--output") == 0
+                && output_path == NULL) {
+            output_path = request->argv[++index];
+        } else if (record_text == NULL && arg[0] != '-') {
+            record_text = arg;
+        } else {
+            *failure = CLI_FAIL_USAGE;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    if (record_text == NULL || name == NULL || input_path == NULL
+            || output_path == NULL || (!unseal && revision_text == NULL)
+            || input_path[0] == '\0' || output_path[0] == '\0') {
+        *failure = CLI_FAIL_USAGE;
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (ksec_hex_decode(record_text, record_id, sizeof record_id) != 0
+            || ksec_validate_name(name, KSEC_MAX_DATASET_NAME) != 0
+            || (!unseal && parse_u64(revision_text, &revision) != 0)) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    if (open_input_path(input_path, &input_fd, &input_owned) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    if (open_exclusive_output(output_path, &output_fd, &output_owned,
+                              &output_created) != 0) {
+        result = errno == EEXIST ? KSEC_ERR_EXISTS : KSEC_ERR_IO;
+        goto out;
+    }
+    if (unseal && !output_owned) {
+        int tty = terminal_status(output_fd);
+        if (tty < 0) {
+            result = KSEC_ERR_IO;
+            goto out;
+        }
+        if (tty == 1) {
+            *failure = CLI_FAIL_TERMINAL;
+            result = KSEC_ERR_INVALID;
+            goto out;
+        }
+    }
+    /* output_fd is written only after the daemon returns KSEC_OK. */
+    if (unseal) {
+        uint64_t actual = 0U;
+        result = ksec_unseal_fd(client, record_id, name, input_fd, output_fd,
+                                &actual);
+        if (result == KSEC_OK) result = write_revision_line(actual);
+    } else {
+        result = ksec_seal_fd(client, record_id, name, revision, input_fd,
+                              output_fd);
+    }
+out:
+    if (result != KSEC_OK && output_created) {
+        unlink_exact_created_file(output_path, output_fd);
+    }
+    if (input_owned && input_fd >= 0 && close(input_fd) != 0 && result == KSEC_OK) {
+        result = KSEC_ERR_IO;
+    }
+    if (output_owned && output_fd >= 0 && close(output_fd) != 0 && result == KSEC_OK) {
+        result = KSEC_ERR_IO;
+    }
+    sodium_memzero(record_id, sizeof record_id);
+    return result;
+}
+
+static ksec_result command_status(const cli_request *request, ksec_client *client,
+                                  int *failure) {
+    uint32_t flags = 0U;
+    uint32_t known = KSEC_STATUS_INITIALIZED | KSEC_STATUS_RECOVERY_CONFIRMED
+            | KSEC_STATUS_UNLOCKED;
+    char line[80];
+    int written;
+    ksec_result result;
+    if (request->argc != 1) {
+        *failure = CLI_FAIL_USAGE;
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_status(client, &flags);
+    if (result != KSEC_OK) return result;
+    if ((flags & ~known) != 0U) return KSEC_ERR_PROTOCOL;
+    written = snprintf(line, sizeof line,
+                       "initialized=%s recovery_confirmed=%s unlocked=%s\n",
+                       (flags & KSEC_STATUS_INITIALIZED) != 0U ? "yes" : "no",
+                       (flags & KSEC_STATUS_RECOVERY_CONFIRMED) != 0U ? "yes" : "no",
+                       (flags & KSEC_STATUS_UNLOCKED) != 0U ? "yes" : "no");
+    if (written < 0 || (size_t)written >= sizeof line
+            || ksec_write_all(STDOUT_FILENO, line, (size_t)written) != 0) {
+        return KSEC_ERR_IO;
+    }
+    return KSEC_OK;
+}
+
 static int worker_command(const cli_request *request, int capability_fd) {
     const char *command = request->argv[0];
     ksec_client *client = NULL;
     ksec_result result = ksec_connect_at(&client, request->socket_path, capability_fd);
+    int failure = CLI_FAIL_NONE;
     int exit_code = 1;
     if (result != KSEC_OK) {
         fprintf(stderr, "kilix-secrets: %s\n", ksec_result_string(result));
@@ -584,71 +1279,19 @@ init_out:
         }
         if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
     } else if (strcmp(command, "add") == 0) {
-        const char *type = NULL;
-        const char *label = NULL;
-        const char *field_name = NULL;
-        int secret_fd = -1;
-        int index;
-        ksec_secure_buffer value = {0};
-        uint8_t record_id[KSEC_RECORD_ID_BYTES];
-        for (index = 1; index < request->argc; index++) {
-            if (index + 1 < request->argc && strcmp(request->argv[index], "--type") == 0) type = request->argv[++index];
-            else if (index + 1 < request->argc && strcmp(request->argv[index], "--label") == 0) label = request->argv[++index];
-            else if (index + 1 < request->argc && strcmp(request->argv[index], "--field") == 0) field_name = request->argv[++index];
-            else if (index + 1 < request->argc && strcmp(request->argv[index], "--secret-fd") == 0) {
-                if (parse_fd(request->argv[++index], &secret_fd) != 0) secret_fd = -1;
-            } else { result = KSEC_ERR_INVALID; goto add_out; }
-        }
-        if (secret_fd < 0) secret_fd = prompt_secret_fd("Secret value: ", 1U);
-        if (type == NULL || label == NULL || field_name == NULL || secret_fd < 0
-                || ksec_secure_alloc(&value, KSEC_MAX_SECRET_BYTES) != KSEC_OK) {
-            result = KSEC_ERR_INVALID;
-            goto add_out;
-        }
-        {
-            size_t length = 0;
-            for (;;) {
-                ssize_t count = read(secret_fd, value.data + length, value.len - length);
-                if (count < 0 && errno == EINTR) continue;
-                if (count < 0) { result = KSEC_ERR_IO; goto add_out; }
-                if (count == 0) break;
-                length += (size_t)count;
-                if (length == value.len) {
-                    uint8_t extra;
-                    count = read(secret_fd, &extra, 1U);
-                    sodium_memzero(&extra, sizeof extra);
-                    if (count != 0) { result = KSEC_ERR_LIMIT; goto add_out; }
-                    break;
-                }
-            }
-            while (length > 0U && (value.data[length - 1U] == (uint8_t)'\n'
-                    || value.data[length - 1U] == (uint8_t)'\r')) length--;
-            if (length == 0U) { result = KSEC_ERR_INVALID; goto add_out; }
-            value.len = length;
-        }
-        {
-            ksec_field field = {field_name, value.data, value.len};
-            ksec_record record = {
-                request->app_id, type, label, 0U, &field, 1U, NULL, 0U
-            };
-            result = ksec_put(client, &record, record_id);
-        }
-        if (result == KSEC_OK) {
-            char id_hex[KSEC_RECORD_ID_BYTES * 2U + 1U];
-            char line[KSEC_RECORD_ID_BYTES * 2U + 1U];
-            ksec_hex_encode(record_id, KSEC_RECORD_ID_BYTES, id_hex);
-            memcpy(line, id_hex, KSEC_RECORD_ID_BYTES * 2U);
-            line[KSEC_RECORD_ID_BYTES * 2U] = '\n';
-            if (ksec_write_all(STDOUT_FILENO, line, sizeof line) != 0) {
-                result = KSEC_ERR_IO;
-            }
-            sodium_memzero(line, sizeof line);
-            sodium_memzero(id_hex, sizeof id_hex);
-        }
-add_out:
-        if (secret_fd > STDERR_FILENO) (void)close(secret_fd);
-        ksec_secure_free(&value);
-        sodium_memzero(record_id, sizeof record_id);
+        result = command_add(request, client, &failure);
+    } else if (strcmp(command, "replace") == 0) {
+        result = command_replace(request, client, &failure);
+    } else if (strcmp(command, "get") == 0) {
+        result = command_get(request, client, &failure);
+    } else if (strcmp(command, "dataset-create") == 0) {
+        result = command_dataset_create(request, client, &failure);
+    } else if (strcmp(command, "seal") == 0) {
+        result = command_seal(request, client, &failure, false);
+    } else if (strcmp(command, "unseal") == 0) {
+        result = command_seal(request, client, &failure, true);
+    } else if (strcmp(command, "status") == 0) {
+        result = command_status(request, client, &failure);
     } else if (strcmp(command, "copy") == 0
             && (request->argc == 3 || request->argc == 5)) {
         uint8_t id[KSEC_RECORD_ID_BYTES];
@@ -941,6 +1584,18 @@ reset_out:
         result = ksec_doctor_to_fd(client, STDOUT_FILENO);
     } else {
         result = KSEC_ERR_INVALID;
+    }
+    if (failure == CLI_FAIL_USAGE) {
+        usage(stderr);
+        ksec_client_free(client);
+        return 2;
+    }
+    if (failure == CLI_FAIL_TERMINAL) {
+        static const char message[] =
+            "kilix-secrets: refusing to write to a terminal\n";
+        (void)ksec_write_all(STDERR_FILENO, message, sizeof message - 1U);
+        ksec_client_free(client);
+        return 1;
     }
     if (result == KSEC_OK) exit_code = 0;
     else fprintf(stderr, "kilix-secrets: %s\n", ksec_result_string(result));
