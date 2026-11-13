@@ -154,12 +154,22 @@ static ksec_result sensitive_fd_from_bytes(const uint8_t *data, size_t length,
     return KSEC_OK;
 }
 
+enum {
+    SENSITIVE_EXACT = 0,
+    SENSITIVE_STRIP_LINE_ENDINGS = 1
+};
+
 static ksec_result read_sensitive_fd(int fd, size_t minimum, size_t maximum,
+                                     int line_endings,
                                      ksec_secure_buffer *buffer) {
     size_t total = 0;
     ksec_result result;
     if (fd < 0 || buffer == NULL || minimum == 0 || maximum < minimum
             || maximum > KSEC_MAX_RECORD_PLAINTEXT) return KSEC_ERR_INVALID;
+    if (line_endings != SENSITIVE_EXACT
+            && line_endings != SENSITIVE_STRIP_LINE_ENDINGS) {
+        return KSEC_ERR_INVALID;
+    }
     result = ksec_secure_alloc(buffer, maximum);
     if (result != KSEC_OK) return result;
     for (;;) {
@@ -179,8 +189,14 @@ static ksec_result read_sensitive_fd(int fd, size_t minimum, size_t maximum,
             break;
         }
     }
-    while (total > 0U && (buffer->data[total - 1U] == (uint8_t)'\n'
-            || buffer->data[total - 1U] == (uint8_t)'\r')) total--;
+    if (line_endings == SENSITIVE_STRIP_LINE_ENDINGS) {
+        size_t raw_total = total;
+        while (total > 0U && (buffer->data[total - 1U] == (uint8_t)'\n'
+                || buffer->data[total - 1U] == (uint8_t)'\r')) total--;
+        if (raw_total > total) {
+            sodium_memzero(buffer->data + total, raw_total - total);
+        }
+    }
     if (total < minimum) { result = KSEC_ERR_INVALID; goto fail; }
     buffer->len = total;
     return KSEC_OK;
@@ -528,7 +544,8 @@ static ksec_result handle_init(daemon_state *state, daemon_connection *connectio
                        connection->capability->app_id, NULL);
     if (result != KSEC_OK) return result;
     if (!retry_unconfirmed && !state->kdf_configured) return KSEC_ERR_INVALID;
-    result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
+    result = read_sensitive_fd(received_fd, 8U, 1024U,
+                               SENSITIVE_STRIP_LINE_ENDINGS, &passphrase);
     if (result != KSEC_OK) return result;
     result = ksec_secure_alloc(&master, KSEC_MASTER_KEY_BYTES);
     if (result != KSEC_OK) goto out;
@@ -636,8 +653,9 @@ static ksec_result handle_unlock(daemon_state *state, daemon_connection *connect
                                 connection->capability->app_id, NULL);
         return KSEC_ERR_DENIED;
     }
-    result = read_sensitive_fd(received_fd, slot_type == KSEC_SLOT_RECOVERY ? 64U : 8U,
-                               1024U, &secret);
+    result = read_sensitive_fd(received_fd,
+                               slot_type == KSEC_SLOT_RECOVERY ? 64U : 8U,
+                               1024U, SENSITIVE_STRIP_LINE_ENDINGS, &secret);
     if (result != KSEC_OK) return result;
     result = ksec_secure_alloc(&master, KSEC_MASTER_KEY_BYTES);
     if (result != KSEC_OK) goto out;
@@ -707,7 +725,8 @@ static ksec_result handle_change_passphrase(
     result = authorize(state, connection, KSEC_VERB_REPLACE,
                        connection->capability->app_id, NULL);
     if (result != KSEC_OK) return result;
-    result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
+    result = read_sensitive_fd(received_fd, 8U, 1024U,
+                               SENSITIVE_STRIP_LINE_ENDINGS, &passphrase);
     if (result != KSEC_OK) return result;
     for (index = 0U; index < state->header.slot_count; index++) {
         if (state->header.slots[index].slot_type == KSEC_SLOT_PASSPHRASE) {
@@ -767,7 +786,8 @@ static ksec_result handle_rotate_master(
     if (result != KSEC_OK) return result;
     memcpy(app_id, connection->capability->app_id,
            strlen(connection->capability->app_id) + 1U);
-    result = read_sensitive_fd(received_fd, 48U, 2056U, &framed);
+    result = read_sensitive_fd(received_fd, 48U, 2056U,
+                               SENSITIVE_EXACT, &framed);
     if (result != KSEC_OK) goto out;
     if (framed.len < 8U) { result = KSEC_ERR_INVALID; goto out; }
     passphrase_len = ksec_get_u32(framed.data);
@@ -868,7 +888,8 @@ static ksec_result handle_export_backup(
     result = authorize(state, connection, KSEC_VERB_READ,
                        connection->capability->app_id, NULL);
     if (result != KSEC_OK) return result;
-    result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
+    result = read_sensitive_fd(received_fd, 8U, 1024U,
+                               SENSITIVE_STRIP_LINE_ENDINGS, &passphrase);
     if (result != KSEC_OK) goto out;
     result = audit_state_event(state, "export", "begin", connection->uid,
                                connection->pid,
@@ -1003,7 +1024,8 @@ static ksec_result handle_reset_vault(
     if (result != KSEC_OK) return result;
     memcpy(app_id, connection->capability->app_id,
            strlen(connection->capability->app_id) + 1U);
-    result = read_sensitive_fd(received_fd, 8U, 1024U, &passphrase);
+    result = read_sensitive_fd(received_fd, 8U, 1024U,
+                               SENSITIVE_STRIP_LINE_ENDINGS, &passphrase);
     if (result != KSEC_OK) goto out;
     result = ksec_secure_alloc(&new_master, KSEC_MASTER_KEY_BYTES);
     if (result != KSEC_OK) goto out;
@@ -1103,7 +1125,8 @@ static ksec_result handle_put(daemon_state *state, daemon_connection *connection
         result = authorize(state, connection, KSEC_VERB_CREATE, owner, NULL);
     }
     if (result != KSEC_OK) return result;
-    result = read_sensitive_fd(received_fd, 1U, KSEC_MAX_RECORD_PLAINTEXT, &encoded);
+    result = read_sensitive_fd(received_fd, 1U, KSEC_MAX_RECORD_PLAINTEXT,
+                               SENSITIVE_EXACT, &encoded);
     if (result != KSEC_OK) return result;
     result = ksec_record_parse(encoded.data, encoded.len, &record);
     if (result != KSEC_OK) goto out;

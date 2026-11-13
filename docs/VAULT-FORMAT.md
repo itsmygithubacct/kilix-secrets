@@ -109,11 +109,62 @@ for explicit recovery. Whole-file offline rollback is not prevented.
 
 The frozen contract is `docs/SEALED-DATASETS.md` section 2.
 
-PLACEHOLDER (lane L1): final format-registry text for object type 4.
+Object type 4 is a dataset key. Record associated data (`KSVAD001`) accepts
+object types 1, 2, 3 and 4. Object type 5 and every greater value stay invalid;
+`tests/corpus/ad-object-type.case` carries type 5. The plaintext uses the
+unchanged record encoding: expiry 0, no grants, type `dataset-key`, a label
+under the ordinary label rules, and exactly one field named `dataset-key`
+whose value is 32 bytes. The daemon draws those bytes. PUT and REPLACE cannot
+store object type 4 or the type string `dataset-key`. GET, GRANT and REVOKE
+refuse the record. DELETE, LIST, SHOW, compaction, master rotation and
+encrypted backup carry it like any other record, so a file sealed under the
+key stays readable after those operations in the same vault UUID. A daemon
+built before this amendment rejects object type 4 and refuses to load a vault
+that holds one. Nothing is deleted.
 
 ## Sealed dataset file v1
 
 The frozen contract is `docs/SEALED-DATASETS.md` section 4.
 
-PLACEHOLDER (lane L1): final byte layout, associated data, chunking and the
-`tests/vectors/dataset-v1.txt` vector description.
+Integers are big-endian. `n` is the owner length and `m` is the name length.
+
+| Offset | Bytes | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `KSDSET01` |
+| 8 | 2 | version 1 |
+| 10 | 2 | stream ID 1 (`crypto_secretstream_xchacha20poly1305`) |
+| 12 | 4 | chunk size 65536 |
+| 16 | 16 | vault UUID |
+| 32 | 16 | dataset key record ID |
+| 48 | 8 | dataset revision |
+| 56 | 8 | plaintext length L, 0 through 67108864 |
+| 64 | 2 | owner length n, 1 through 64 |
+| 66 | n | owner application ID |
+| 66+n | 2 | name length m, 1 through 128 |
+| 68+n | m | dataset name |
+| 68+n+m | 24 | secretstream header |
+| 92+n+m | | chunks |
+
+The header prefix is bytes `[0, 68+n+m)`. The stream key is
+`crypto_kdf_derive_from_key` with subkey 1 and context `KSDSET01`, taken from
+the 32-byte dataset key. The record key is never the stream key. Chunk count
+is `k = max(1, ceil(L / 65536))`. Chunks 1 through k−1 each carry 65536
+plaintext bytes and `TAG_MESSAGE`. Chunk k carries the remainder, which is 0
+only when L is 0, and `TAG_FINAL`. Each chunk on disk is its plaintext length
+plus 17 bytes. The associated data of every chunk is the complete header
+prefix. The file is exactly `92 + n + m + L + 17·k` bytes. Any other length,
+unknown version, stream ID or chunk size, length field out of range, owner or
+name outside its grammar, wrong tag, early `TAG_FINAL`, or missing final tag
+is an error.
+
+Plaintext passes through locked memory one chunk at a time. Unseal compares
+the vault UUID, key record ID, owner and name with the caller's expected
+values before decryption.
+
+`tests/vectors/dataset-v1.txt` freezes one dataset key, the derived stream
+key, the header prefix and the complete sealed file for plaintext lengths 0,
+100 and 65537, together with each plaintext SHA-256. The generator installs a
+deterministic `randombytes` implementation only while it runs: a fixed 32-byte
+seed, advanced between draws, backed by `randombytes_buf_deterministic`.
+`make test` and `make sanitize` regenerate the file and require byte-identical
+output.
