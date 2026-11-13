@@ -115,4 +115,36 @@ PLACEHOLDER (lane L2): final protocol text for `DATASET_CREATE`, `SEAL` and
 
 The frozen contract is `docs/SEALED-DATASETS.md` section 3.
 
-PLACEHOLDER (lane L3): final protocol text for `STATUS` and `WATCH`.
+`STATUS` (operation 26) carries an empty payload and no descriptor. It needs
+an activated, unexpired capability and no verb. It is not audited, and it
+works while the vault is locked. A short, long, or trailing payload, or any
+request descriptor, is `KSEC_ERR_PROTOCOL`. An expired, inactive, or
+process-mismatched capability is `KSEC_ERR_DENIED` (the same code
+`ksec_policy_authorize` returns for an expired capability; `KSEC_ERR_EXPIRED`
+stays reserved for expired records). The success payload is a big-endian u32
+version, which is 1 (`KSEC_STATUS_VERSION`), followed by a big-endian u32
+flag word. Bit 0 (`KSEC_STATUS_INITIALIZED`, value 1) means a vault header is
+loaded. Bit 1 (`KSEC_STATUS_RECOVERY_CONFIRMED`, value 2) means recovery has
+been confirmed. Bit 2 (`KSEC_STATUS_UNLOCKED`, value 4) means the master key
+is held. Every other bit is zero. The client rejects a version other than 1,
+or a success payload that is not exactly these eight bytes, as
+`KSEC_ERR_PROTOCOL`. A global lock clears every capability, so the caller
+mints a new one before asking again.
+
+`WATCH` (operation 27) carries an empty payload and no descriptor. It needs
+the same live capability and an unlocked vault. A locked vault is
+`KSEC_ERR_LOCKED`. The daemon returns one end of a fresh
+`socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC)` and keeps the other.
+Nothing is ever written on it. The client returns that end close-on-exec and
+nonblocking. At most `KSEC_MAX_WATCHES` (128) watches exist; another request
+is `KSEC_ERR_LIMIT`. The daemon closes its end, so the client observes
+`POLLHUP`, on every path that closes identity leases for the whole vault:
+global lock (idle timeout, logind session lock, SIGUSR1, `LOCK`), master
+rotation, backup import, destructive reset, storage failure that forces
+lock, and daemon stop. It also closes the watch on expiry of the capability
+that asked and on disconnect of the connection that asked. Closing the
+client end frees the slot on the daemon's next expire pass. Watches are not
+per-record, so replacing or deleting a record does not close them.
+Passphrase-slot rewrap, compaction, and backup export do not close them:
+those paths preserve the unlocked vault and do not close every identity
+lease.
