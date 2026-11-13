@@ -8,37 +8,31 @@ the target is unchanged and a staged name, if one was created, is removed.
 
 from __future__ import annotations
 
-import ctypes
 import os
 import secrets
 
-from kilix_secrets._binding import Invalid, IoError, KilixSecretsError
-
-_AT_EMPTY_PATH = 0x1000
-_libc: ctypes.CDLL | None = None
-
-
-def _linkat() -> ctypes.CDLL:
-    global _libc
-    if _libc is None:
-        lib = ctypes.CDLL(None, use_errno=True)
-        lib.linkat.argtypes = [
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
-        ]
-        lib.linkat.restype = ctypes.c_int
-        _libc = lib
-    return _libc
+from kilix_secrets._binding import (
+    Invalid,
+    IoError,
+    KilixSecretsError,
+    require_revision,
+    require_text,
+)
 
 
 def _link_fd(tmp_fd: int, dir_fd: int, name: str) -> None:
-    encoded = os.fsencode(name)
-    ctypes.set_errno(0)
-    if _linkat().linkat(tmp_fd, b"", dir_fd, encoded, _AT_EMPTY_PATH) == 0:
-        return
-    err = ctypes.get_errno()
-    if err == 17:  # EEXIST
-        raise FileExistsError(name)
-    raise IoError(os.strerror(err) if err else "linkat failed")
+    """Link an O_TMPFILE inode via /proc/self/fd. No AT_EMPTY_PATH."""
+    try:
+        os.link(
+            f"/proc/self/fd/{tmp_fd}",
+            name,
+            dst_dir_fd=dir_fd,
+            follow_symlinks=True,
+        )
+    except FileExistsError:
+        raise FileExistsError(name) from None
+    except OSError as exc:
+        raise IoError(os.strerror(exc.errno) if exc.errno else "link failed") from exc
 
 
 def _unlink(dir_fd: int, name: str) -> None:
@@ -50,6 +44,7 @@ def _unlink(dir_fd: int, name: str) -> None:
 
 def publish(target: str, write_fn) -> None:
     """Write ``write_fn(fd)`` into a 0600 file and rename it onto ``target``."""
+    target = require_text(target, "target path")
     directory, name = os.path.split(os.path.abspath(target))
     if not directory or not name or name in {".", ".."}:
         raise Invalid("target path is invalid")
@@ -94,6 +89,10 @@ def publish(target: str, write_fn) -> None:
 def seal_file(client, record_id: bytes, dataset_name: str, revision: int,
               source: str, target: str) -> None:
     """Seal ``source`` and publish it as ``target``. ``source`` is not modified."""
+    dataset_name = require_text(dataset_name, "dataset name")
+    revision = require_revision(revision)
+    source = require_text(source, "source path")
+    target = require_text(target, "target path")
 
     def write(out_fd: int) -> None:
         in_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
@@ -108,6 +107,9 @@ def seal_file(client, record_id: bytes, dataset_name: str, revision: int,
 def unseal_file(client, record_id: bytes, dataset_name: str,
                 source: str, target: str) -> int:
     """Unseal ``source`` and publish the plaintext as ``target``. Returns the revision."""
+    dataset_name = require_text(dataset_name, "dataset name")
+    source = require_text(source, "source path")
+    target = require_text(target, "target path")
     found = {"revision": 0}
 
     def write(out_fd: int) -> None:
