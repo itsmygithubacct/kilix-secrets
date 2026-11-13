@@ -43,9 +43,14 @@ install, upgrade, rollback, remove, reinstall, and purge in an isolated root;
 package removal and purge preserve user vault data.
 
 The administrative CLI includes `init`, `unlock`, `lock`, `passwd`, `add`,
-`show`, `grant`, `revoke`, `copy`, `run`, `list`, `delete`, `rotate`, `export`,
+`replace`, `get`, `show`, `grant`, `revoke`, `copy`, `run`, `list`,
+`dataset-create`, `seal`, `unseal`, `status`, `delete`, `rotate`, `export`,
 `import`, `compact`, and `doctor`. Destructive record deletion requires the
-exact form `delete RECORD --confirm RECORD`.
+exact form `delete RECORD --confirm RECORD`. `get` writes a field only to a
+new 0600 file (`--output FILE`) or a descriptor (`--output-fd N`), never to a
+terminal. `replace RECORD --field NAME` replaces the record's fields with that
+one field and keeps its type, label, expiry and grants. `add` and `replace`
+strip trailing CR and LF bytes from the value unless given `--raw`.
 Backup output is encrypted-only, is created as a new 0600 file, and is never
 silently overwritten. Import verifies the complete artifact, retains the
 displaced generation, then locks the vault. Restoring an older valid artifact
@@ -87,6 +92,48 @@ returns `KSEC_ERR_CONFLICT`. Lock, delete, key replacement, master rotation,
 import, reset, capability/process expiry, connection loss and daemon exit close
 the relevant lease. The portable coherent-rollback limit still applies.
 
+## Sealed datasets
+
+An application that needs more than a few records keeps its own encrypted
+file, and the vault holds only the key. `ksec_dataset_create` makes a
+dataset-key record (object type 4) owned by the calling application: 32 bytes
+the daemon generates, never returns, never replaces and never grants.
+`ksec_seal_fd` and `ksec_unseal_fd` send up to 64 MiB through sealed memfds;
+the daemon encrypts or decrypts under that key and returns a sealed memfd.
+The client writes the output descriptor only after the daemon reports
+success. The caller writes to a temporary file and renames it.
+
+A sealed file (`KSDSET01`) names its vault, key record, owner, dataset name,
+revision and exact length, and authenticates all of them on every chunk. A
+file from another vault, key, owner or name is a `KSEC_ERR_CONFLICT`; any
+damage, truncation or extension fails. The format does not prevent rollback:
+an older file of the same dataset still opens and reports its older revision,
+so the application compares revisions itself. Deleting the key record or
+resetting the vault makes every file sealed under it unreadable. A daemon
+older than this change refuses to unlock a vault that holds a dataset key.
+
+`ksec_status` reports initialized, recovery-confirmed and unlocked without a
+verb and works while locked. `ksec_watch` returns a descriptor the daemon
+hangs up when the vault locks, the master key rotates, a backup is imported,
+the vault is reset, the asking capability expires or disconnects, or the
+daemon stops; the application then asks STATUS on a fresh capability.
+
+CLI: `dataset-create --label LABEL`;
+`seal RECORD --name NAME --revision N --input FILE|- --output FILE|-`;
+`unseal RECORD --name NAME --input FILE|- --output FILE|-` (prints
+`revision=N` on stderr); `status`.
+
+See `docs/SEALED-DATASETS.md`, `docs/PROTOCOL.md` and `docs/VAULT-FORMAT.md`.
+
+## Python binding
+
+`python/kilix_secrets` is a standard-library ctypes binding for Python 3.11
+and newer, installed to `lib/python3/dist-packages` and shipped in the
+package. `Session` runs vault calls in a worker child process that holds the
+capability and is renewed before the capability expires. `Watcher` keeps a
+`WATCH` open and calls back when the vault locks. `seal_file` and
+`unseal_file` publish atomically. See `docs/PYTHON.md`.
+
 ## Security boundary
 
 The daemon protects a locked vault against offline inspection and refuses
@@ -96,6 +143,9 @@ They do not contain root, a compromised kernel, injected daemon code, or a
 hostile process that already controls the user's session. Portable whole-file
 rollback while the daemon is stopped can be undetectable.
 
+Sealed datasets keep this boundary. While the vault is unlocked, any process
+that can act as the owning application can seal and unseal its files.
+
 See `docs/THREAT-MODEL.md`, `docs/VAULT-FORMAT.md`,
-`docs/F113-CUSTODY-INTERFACE.md`, and `SECURITY.md` before using or reviewing
-the code.
+`docs/F113-CUSTODY-INTERFACE.md`, `docs/SEALED-DATASETS.md`, and `SECURITY.md`
+before using or reviewing the code.
