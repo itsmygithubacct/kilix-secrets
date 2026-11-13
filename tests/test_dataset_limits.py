@@ -511,14 +511,6 @@ def stop_daemon(process: subprocess.Popen[bytes]) -> None:
         process.stderr.close()
 
 
-def status_operation_exists(repository: Path) -> bool:
-    text = (repository / "src" / "client.c").read_text(encoding="utf-8")
-    start = text.find("ksec_result ksec_status(")
-    if start < 0:
-        return False
-    return "PLACEHOLDER (lane L3)" not in text[start:start + 600]
-
-
 def needs_sanitizer(library: Path) -> bool:
     return b"libasan.so" in library.read_bytes()
 
@@ -928,19 +920,13 @@ def main() -> int:
                          and read_byte(plain, PLAINTEXT_BYTES - 1) == BYTE_AT_LAST,
                          "plaintext fixture matches the literal pattern bytes")
 
-            status_client: Client | None = None
-            ready = None
-            if status_operation_exists(repository):
-                status_client = start_client(binary, socket_path, ["status"], True)
-                clients.append(status_client)
-                ready = status_client.wait_for(30, lambda item: item == "READY"
-                                                or item.startswith("SETUP")
-                                                or item.startswith("RESULT"))
-                checks.check(ready == "READY",
-                             f"status client is connected before the seal ({ready})")
-            else:
-                print("status during seal: skipped (MERGED-L3 is not in this tree)")
-                status_text = "skipped (MERGED-L3 is not in this tree)"
+            status_client = start_client(binary, socket_path, ["status"], True)
+            clients.append(status_client)
+            ready = status_client.wait_for(30, lambda item: item == "READY"
+                                            or item.startswith("SETUP")
+                                            or item.startswith("RESULT"))
+            checks.check(ready == "READY",
+                         f"status client is connected before the seal ({ready})")
 
             time.sleep(0.05)
             baseline = rss_anon_kib(process.pid)
@@ -959,36 +945,34 @@ def main() -> int:
             if sealing == "SEALING":
                 seal_in_daemon = wait_for_seal_request(
                     process.pid, seal_client, 120.0)
+            overlap = ("daemon held the seal request"
+                       if seal_in_daemon else
+                       "seal request was not held when STATUS was issued")
+            status_line = None
             if (sealing == "SEALING" and ready == "READY"
-                    and status_client is not None
                     and status_client.proc.stdin is not None):
-                overlap = ("daemon held the seal request"
-                           if seal_in_daemon else
-                           "seal request was not held when STATUS was issued")
                 status_client.proc.stdin.write(b"G")
                 status_client.proc.stdin.flush()
                 status_line = status_client.wait_for(
                     180, lambda item: item.startswith("RESULT") or item.startswith("SETUP"))
-                status_parsed = parse_result(status_line)
-                status_code, status_err = status_client.finish(10)
-                clients.remove(status_client)
-                if status_parsed is None:
-                    checks.check(False, f"status during seal produced no result "
-                                 f"(exit={status_code} {status_line} {tail(status_err)})")
-                    status_text = "no result"
-                else:
-                    status_seconds = status_parsed[1]
-                    status_text = f"{status_seconds:.3f} ({overlap})"
-                    checks.check(status_code == 0 and status_parsed[0] == KSEC_OK,
-                                 "status during seal returns ok "
-                                 f"(code={status_parsed[0]} {tail(status_err)})")
-                    checks.check(status_parsed[3] == 7,
-                                 "status during seal reports initialized, "
-                                 "recovery-confirmed and unlocked "
-                                 f"(flags={status_parsed[3]})")
-                    checks.check(status_seconds < STATUS_BOUND_SECONDS,
-                                 "status during seal is answered within 5 seconds "
-                                 f"({status_seconds:.3f}s)")
+            status_parsed = parse_result(status_line)
+            status_code, status_err = status_client.finish(10)
+            clients.remove(status_client)
+            status_seconds = status_parsed[1] if status_parsed is not None else -1.0
+            status_text = (f"{status_seconds:.3f} ({overlap})"
+                           if status_parsed is not None else "no result")
+            checks.check(status_parsed is not None and status_code == 0
+                         and status_parsed[0] == KSEC_OK,
+                         "status during seal returns ok "
+                         f"(exit={status_code} line={status_line} {tail(status_err)})")
+            checks.check(status_parsed is not None and status_parsed[3] == 7,
+                         "status during seal reports initialized, "
+                         "recovery-confirmed and unlocked "
+                         f"(flags={None if status_parsed is None else status_parsed[3]})")
+            checks.check(status_parsed is not None
+                         and status_seconds < STATUS_BOUND_SECONDS,
+                         "status during seal is answered within 5 seconds "
+                         f"({status_seconds:.3f}s)")
             if sealing == "SEALING":
                 seal_line = seal_client.wait_for(
                     180, lambda item: item.startswith("RESULT") or item.startswith("SETUP"))
