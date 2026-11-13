@@ -638,7 +638,8 @@ static ksec_result load_show_metadata(ksec_client *client,
                                       char owner[KSEC_MAX_APP_ID + 1U],
                                       char type[KSEC_MAX_TYPE + 1U],
                                       char label[KSEC_MAX_LABEL + 1U],
-                                      uint64_t *expires_at) {
+                                      uint64_t *expires_at,
+                                      size_t *field_count) {
     char buffer[8192];
     size_t length = 0U;
     size_t cursor = 0U;
@@ -646,6 +647,7 @@ static ksec_result load_show_metadata(ksec_client *client,
     bool saw_type = false;
     bool saw_label = false;
     bool saw_expiry = false;
+    bool saw_fields = false;
     int fd = -1;
     ksec_result result;
     memset(buffer, 0, sizeof buffer);
@@ -653,7 +655,10 @@ static ksec_result load_show_metadata(ksec_client *client,
     if (type != NULL) type[0] = '\0';
     if (label != NULL) label[0] = '\0';
     if (client == NULL || record_id == NULL || owner == NULL || type == NULL
-            || label == NULL || expires_at == NULL) return KSEC_ERR_INVALID;
+            || label == NULL || expires_at == NULL || field_count == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    *field_count = 0U;
     fd = memfd_create("ksec-cli-show", MFD_CLOEXEC);
     if (fd < 0) return KSEC_ERR_IO;
     result = ksec_show_to_fd(client, record_id, fd);
@@ -741,10 +746,33 @@ static ksec_result load_show_metadata(ksec_client *client,
             }
             sodium_memzero(text, sizeof text);
             saw_expiry = true;
+        } else if (key_len == 6U && memcmp(buffer + cursor, "fields", 6) == 0) {
+            /* "fields=N/MAX": only N matters. */
+            char text[32];
+            char *slash;
+            uint64_t count = 0U;
+            if (saw_fields || value_len == 0U || value_len >= sizeof text) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            memcpy(text, value, value_len);
+            text[value_len] = '\0';
+            slash = strchr(text, '/');
+            if (slash == NULL) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            *slash = '\0';
+            if (parse_u64(text, &count) != 0 || count > KSEC_MAX_FIELDS) {
+                result = KSEC_ERR_INVALID;
+                goto out;
+            }
+            *field_count = (size_t)count;
+            saw_fields = true;
         }
         cursor = end + 1U;
     }
-    if (!saw_owner || !saw_type || !saw_label || !saw_expiry
+    if (!saw_owner || !saw_type || !saw_label || !saw_expiry || !saw_fields
             || ksec_validate_app_id(owner) != 0
             || ksec_validate_name(type, KSEC_MAX_TYPE) != 0
             || ksec_validate_name(label, KSEC_MAX_LABEL) != 0) {
@@ -758,6 +786,7 @@ out:
         sodium_memzero(type, KSEC_MAX_TYPE + 1U);
         sodium_memzero(label, KSEC_MAX_LABEL + 1U);
         *expires_at = 0U;
+        *field_count = 0U;
     }
     return result;
 }
@@ -848,6 +877,7 @@ static ksec_result command_replace(const cli_request *request, ksec_client *clie
     char type[KSEC_MAX_TYPE + 1U];
     char label[KSEC_MAX_LABEL + 1U];
     uint64_t expires_at = 0U;
+    size_t field_count = 0U;
     ksec_secure_buffer value = {0};
     size_t secret_len = 0U;
     uint8_t record_id[KSEC_RECORD_ID_BYTES];
@@ -889,8 +919,17 @@ static ksec_result command_replace(const cli_request *request, ksec_client *clie
         result = KSEC_ERR_INVALID;
         goto out;
     }
-    result = load_show_metadata(client, record_id, owner, type, label, &expires_at);
+    result = load_show_metadata(client, record_id, owner, type, label, &expires_at,
+                                &field_count);
     if (result != KSEC_OK) goto out;
+    /* The CLI writes exactly one field. Replacing a record that has more
+     * would silently drop the others, so refuse before reading the secret. */
+    if (field_count != 1U) {
+        fprintf(stderr, "kilix-secrets: replace needs a record with exactly one "
+                        "field; this record has %zu\n", field_count);
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
     if (!saw_secret_fd) secret_fd = prompt_secret_fd("Secret value: ", 1U);
     if (secret_fd < 0) {
         result = KSEC_ERR_INVALID;

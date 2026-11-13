@@ -430,6 +430,33 @@ def main() -> int:
                      and raw_shown.stdout == show_text(raw_id, 4, "token", "raw-login"),
                      "replace --raw keeps CR/LF and the record type, label, and expiry")
 
+        # A record with two fields can only come from the C API. The CLI writes
+        # one field, so replacing such a record would drop the other one.
+        two_value = root / "two-field-value.bin"
+        two_value.write_bytes(b"two-field-secret")
+        two_put = subprocess.run(
+            [str(build_dir / "record-helper"), "put2", str(socket_path), str(two_value)],
+            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=30)
+        two_id = record_id_of(two_put.stdout)
+        checks.check(two_put.returncode == 0 and two_id is not None,
+                     "record-helper put2 creates a two-field record")
+        if two_id is None:
+            two_id = MISSING_ID
+        two_before = run_cli(cli, socket_path, app, ["show", two_id])
+        two_replace = run_cli(cli, socket_path, app,
+                              ["replace", two_id, "--field", "value"],
+                              secret=REPLACED)
+        two_after = run_cli(cli, socket_path, app, ["show", two_id])
+        checks.check(two_before.returncode == 0 and b"fields=2/8\n" in two_before.stdout
+                     and two_replace.returncode == 1 and two_replace.stdout == b""
+                     and two_replace.stderr
+                     == b"kilix-secrets: replace needs a record with exactly one field; "
+                        b"this record has 2\nkilix-secrets: invalid input\n"
+                     and two_after.returncode == 0
+                     and two_after.stdout == two_before.stdout,
+                     "replace refuses a two-field record and leaves it unchanged")
+
         stripped = run_cli(cli, socket_path, app,
                            ["add", "--type", "password", "--label", "stripped-login",
                             "--field", "secret"],
