@@ -37,6 +37,13 @@ typedef struct {
 } identity_lease;
 
 typedef struct {
+    bool active;
+    int daemon_fd;
+    int connection_fd;
+    ksec_capability *capability;
+} vault_watch;
+
+typedef struct {
     ksec_store store;
     ksec_vault_header header;
     ksec_secure_buffer master;
@@ -56,6 +63,7 @@ typedef struct {
     uint64_t last_authorized_use;
     ksec_session_monitor *session_monitor;
     identity_lease identity_leases[KSEC_MAX_IDENTITY_LEASES];
+    vault_watch watches[KSEC_MAX_WATCHES];
 } daemon_state;
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -269,6 +277,88 @@ static size_t identity_lease_count(const daemon_state *state) {
     return count;
 }
 
+static void close_watch(vault_watch *watch) {
+    if (watch == NULL || !watch->active) return;
+    if (watch->daemon_fd >= 0) (void)close(watch->daemon_fd);
+    sodium_memzero(watch, sizeof *watch);
+}
+
+static void invalidate_all_watches(daemon_state *state) {
+    size_t index;
+    if (state == NULL) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        close_watch(&state->watches[index]);
+    }
+}
+
+static void invalidate_connection_watches(daemon_state *state,
+                                          int connection_fd) {
+    size_t index;
+    if (state == NULL || connection_fd < 0) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        vault_watch *watch = &state->watches[index];
+        if (watch->active && watch->connection_fd == connection_fd) {
+            close_watch(watch);
+        }
+    }
+}
+
+static size_t watch_count(const daemon_state *state) {
+    size_t index;
+    size_t count = 0U;
+    if (state == NULL) return 0U;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        if (state->watches[index].active) count++;
+    }
+    return count;
+}
+
+/* Live means activated and unexpired, with the same process identity the
+ * capability was minted for. No verb and no record scope: STATUS and WATCH
+ * are not authorized operations. */
+static ksec_result capability_is_live(const ksec_capability *capability) {
+    uint64_t target_start = 0U;
+    uint64_t supervisor_start = 0U;
+    if (capability == NULL || !capability->active || !capability->activated
+            || capability->connection_fd < 0
+            || capability->expires_at <= ksec_now_seconds()) {
+        return KSEC_ERR_DENIED;
+    }
+    if (ksec_process_start_time(capability->target_pid, &target_start) != 0
+            || ksec_process_start_time(capability->supervisor_pid,
+                                       &supervisor_start) != 0
+            || target_start != capability->target_start_time
+            || supervisor_start != capability->supervisor_start_time) {
+        return KSEC_ERR_DENIED;
+    }
+    return KSEC_OK;
+}
+
+static void expire_watches(daemon_state *state) {
+    size_t index;
+    if (state == NULL) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        vault_watch *watch = &state->watches[index];
+        struct pollfd descriptor;
+        int ready;
+        if (!watch->active) continue;
+        descriptor.fd = watch->daemon_fd;
+        descriptor.events = POLLIN;
+        descriptor.revents = 0;
+        ready = poll(&descriptor, 1U, 0);
+        if ((ready > 0
+                && (descriptor.revents
+                    & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                || (ready < 0 && errno != EINTR)) {
+            close_watch(watch);
+            continue;
+        }
+        if (capability_is_live(watch->capability) != KSEC_OK) {
+            close_watch(watch);
+        }
+    }
+}
+
 static void expire_identity_leases(daemon_state *state) {
     size_t index;
     if (state == NULL) return;
@@ -305,6 +395,7 @@ static void expire_identity_leases(daemon_state *state) {
 static void lock_state(daemon_state *state) {
     if (state == NULL) return;
     invalidate_all_identity_leases(state);
+    invalidate_all_watches(state);
     ksec_secure_free(&state->master);
     ksec_store_clear_records(&state->store);
     ksec_policy_clear(&state->policy);
@@ -852,6 +943,7 @@ static ksec_result handle_rotate_master(
     state->master = new_master;
     memset(&new_master, 0, sizeof new_master);
     invalidate_all_identity_leases(state);
+    invalidate_all_watches(state);
     (void)audit_state_event(state, "master-rotation", "ok",
                             connection->uid, connection->pid, app_id, NULL);
     ksec_policy_clear(&state->policy);
@@ -1085,6 +1177,8 @@ static ksec_result parse_record_request(const uint8_t *payload, size_t payload_l
     if (replacement) memcpy(record_id, payload, KSEC_RECORD_ID_BYTES);
     *object_type = ksec_get_u16(payload + (replacement ? 16U : 0U));
     owner_len = ksec_get_u16(payload + (replacement ? 18U : 2U));
+    /* Object type 4 exists only through DATASET_CREATE. */
+    if (*object_type == KSEC_OBJECT_DATASET_KEY) return KSEC_ERR_INVALID;
     if ((*object_type != KSEC_OBJECT_SECRET
             && *object_type != KSEC_OBJECT_DEVICE_IDENTITY)
             || owner_len == 0 || owner_len > KSEC_MAX_APP_ID
@@ -1121,10 +1215,15 @@ static ksec_result handle_put(daemon_state *state, daemon_connection *connection
         if (strcmp(existing->owner, owner) != 0) return KSEC_ERR_DENIED;
         result = authorize_record(state, connection, KSEC_VERB_REPLACE,
                                   existing);
+        if (result != KSEC_OK) return result;
+        /* Dataset keys are immutable. Replacing one is refused even for the owner. */
+        if (existing->object_type == KSEC_OBJECT_DATASET_KEY) {
+            return KSEC_ERR_DENIED;
+        }
     } else {
         result = authorize(state, connection, KSEC_VERB_CREATE, owner, NULL);
+        if (result != KSEC_OK) return result;
     }
-    if (result != KSEC_OK) return result;
     result = read_sensitive_fd(received_fd, 1U, KSEC_MAX_RECORD_PLAINTEXT,
                                SENSITIVE_EXACT, &encoded);
     if (result != KSEC_OK) return result;
@@ -1136,6 +1235,11 @@ static ksec_result handle_put(daemon_state *state, daemon_connection *connection
     }
     memcpy(record.owner, owner, strlen(owner) + 1U);
     record.object_type = object_type;
+    /* The type string is reserved whatever object type the client claims. */
+    if (strcmp(record.type, KSEC_DATASET_KEY_TYPE) == 0) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
     if (replacement) {
         memcpy(record.id, requested_id, KSEC_RECORD_ID_BYTES);
         record.grant_count = existing->grant_count;
@@ -1196,7 +1300,8 @@ static ksec_result handle_get(daemon_state *state, daemon_connection *connection
     if (ksec_validate_name(field, KSEC_MAX_FIELD_NAME) != 0) return KSEC_ERR_INVALID;
     record = ksec_store_find(&state->store, payload);
     if (record == NULL || record->deleted) return KSEC_ERR_NOT_FOUND;
-    if (record->object_type == KSEC_OBJECT_DEVICE_IDENTITY) {
+    if (record->object_type == KSEC_OBJECT_DEVICE_IDENTITY
+            || record->object_type == KSEC_OBJECT_DATASET_KEY) {
         return KSEC_ERR_DENIED;
     }
     result = authorize_record_raw(connection, KSEC_VERB_USE, record);
@@ -1610,7 +1715,8 @@ static ksec_result handle_change_grant(
     result = authorize(state, connection, KSEC_VERB_REPLACE, existing->owner,
                        existing->id);
     if (result != KSEC_OK) return result;
-    if (existing->object_type == KSEC_OBJECT_DEVICE_IDENTITY) {
+    if (existing->object_type == KSEC_OBJECT_DEVICE_IDENTITY
+            || existing->object_type == KSEC_OBJECT_DATASET_KEY) {
         return KSEC_ERR_DENIED;
     }
     while (position < existing->grant_count) {
@@ -1675,23 +1781,261 @@ out:
     return result;
 }
 
-/* ---- Sealed datasets: operations 23-25 (lane L2). SKELETON stubs. ---- */
+/* ---- Sealed datasets: operations 23-25 (lane L2). ---- */
+
+static ksec_result dataset_max_sealed_bytes(uint64_t *maximum) {
+    if (maximum == NULL) return KSEC_ERR_INVALID;
+    return ksec_dataset_sealed_length(
+            KSEC_MAX_DATASET_BYTES,
+            (size_t)KSEC_DATASET_PREFIX_FIXED_BYTES
+                + (size_t)KSEC_MAX_APP_ID
+                + (size_t)KSEC_MAX_DATASET_NAME,
+            maximum);
+}
+
+/*
+ * A request descriptor must already be a memfd sealed against write, grow
+ * and shrink. Anything else is refused before a single byte is read, so a
+ * pipe cannot stall the daemon.
+ */
+static ksec_result dataset_request_size(int fd, uint64_t maximum,
+                                        uint64_t *size_out) {
+    struct stat file_stat;
+    unsigned int required;
+    int seals;
+    if (size_out == NULL) return KSEC_ERR_INVALID;
+    seals = fcntl(fd, F_GET_SEALS);
+    required = (unsigned int)F_SEAL_WRITE | (unsigned int)F_SEAL_GROW
+        | (unsigned int)F_SEAL_SHRINK;
+    if (seals < 0 || ((unsigned int)seals & required) != required) {
+        return KSEC_ERR_INVALID;
+    }
+    if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)
+            || file_stat.st_size < 0) {
+        return KSEC_ERR_INVALID;
+    }
+    if ((uint64_t)file_stat.st_size > maximum) return KSEC_ERR_LIMIT;
+    *size_out = (uint64_t)file_stat.st_size;
+    return KSEC_OK;
+}
+
+static ksec_result finish_dataset_reply(int fd) {
+    if (fd < 0 || lseek(fd, 0, SEEK_SET) != 0
+            || fcntl(fd, F_ADD_SEALS,
+                     F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW
+                         | F_SEAL_WRITE) != 0) {
+        return KSEC_ERR_IO;
+    }
+    return KSEC_OK;
+}
+
+static void discard_reply(int *reply_fd) {
+    if (reply_fd != NULL && *reply_fd >= 0) {
+        (void)close(*reply_fd);
+        *reply_fd = -1;
+    }
+}
 
 static ksec_result handle_dataset_create(
         daemon_state *state, daemon_connection *connection,
         const uint8_t *payload, size_t payload_len, int received_fd,
         uint8_t response_id[KSEC_RECORD_ID_BYTES]) {
-    (void)state; (void)connection; (void)payload; (void)payload_len;
-    (void)received_fd; (void)response_id;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    char label[KSEC_MAX_LABEL + 1U];
+    ksec_owned_record record;
+    uint8_t id[KSEC_RECORD_ID_BYTES];
+    size_t owner_len;
+    ksec_result result;
+    memset(label, 0, sizeof label);
+    memset(&record, 0, sizeof record);
+    memset(id, 0, sizeof id);
+    if (state == NULL || connection == NULL || response_id == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    result = ksec_dataset_parse_create_request(payload, payload_len, label);
+    if (result != KSEC_OK) {
+        sodium_memzero(label, sizeof label);
+        return result;
+    }
+    if (received_fd >= 0) {
+        sodium_memzero(label, sizeof label);
+        return KSEC_ERR_PROTOCOL;
+    }
+    if (!state->unlocked) {
+        sodium_memzero(label, sizeof label);
+        return KSEC_ERR_LOCKED;
+    }
+    result = authorize(state, connection, KSEC_VERB_CREATE,
+                       connection->capability->app_id, NULL);
+    if (result != KSEC_OK) {
+        sodium_memzero(label, sizeof label);
+        return result;
+    }
+    if (state->store.record_count >= KSEC_MAX_RECORDS) {
+        sodium_memzero(label, sizeof label);
+        return KSEC_ERR_LIMIT;
+    }
+    owner_len = strlen(connection->capability->app_id);
+    if (owner_len == 0U || owner_len > KSEC_MAX_APP_ID
+            || strlen(label) > KSEC_MAX_LABEL) {
+        sodium_memzero(label, sizeof label);
+        return KSEC_ERR_INVALID;
+    }
+    memcpy(record.owner, connection->capability->app_id, owner_len + 1U);
+    memcpy(record.type, KSEC_DATASET_KEY_TYPE, sizeof KSEC_DATASET_KEY_TYPE);
+    memcpy(record.label, label, strlen(label) + 1U);
+    record.object_type = KSEC_OBJECT_DATASET_KEY;
+    record.expires_at = 0U;
+    record.field_count = 1U;
+    record.grant_count = 0U;
+    memcpy(record.fields[0].name, KSEC_DATASET_KEY_FIELD,
+           sizeof KSEC_DATASET_KEY_FIELD);
+    result = ksec_secure_alloc(&record.fields[0].value, KSEC_DATASET_KEY_BYTES);
+    if (result != KSEC_OK) goto out;
+    randombytes_buf(record.fields[0].value.data, KSEC_DATASET_KEY_BYTES);
+    do {
+        randombytes_buf(record.id, KSEC_RECORD_ID_BYTES);
+    } while (ksec_store_find(&state->store, record.id) != NULL);
+    if (ksec_validate_dataset_key_record(&record) != KSEC_OK) {
+        result = KSEC_ERR_INVALID;
+        goto out;
+    }
+    memcpy(id, record.id, sizeof id);
+    result = audit_state_event(state, "dataset-create", "begin",
+                               connection->uid, connection->pid,
+                               connection->capability->app_id, id);
+    if (result != KSEC_OK) goto out;
+    result = ksec_store_append(&state->store, &state->header, state->master.data,
+                               &record, false);
+    result = finish_store_mutation(state, result);
+    if (result == KSEC_OK) {
+        memcpy(response_id, id, sizeof id);
+        (void)audit_state_event(state, "dataset-create", "ok",
+                                connection->uid, connection->pid,
+                                connection->capability->app_id, id);
+    }
+out:
+    ksec_owned_record_clear(&record);
+    sodium_memzero(label, sizeof label);
+    sodium_memzero(id, sizeof id);
+    return result;
+}
+
+/*
+ * Shared SEAL/UNSEAL prefix. Order is the contract's: payload grammar,
+ * descriptor present, unlocked, record, use, dataset-key schema. Seals and
+ * size are checked by the caller after this returns, still before audit.
+ */
+static ksec_result begin_dataset_use(
+        daemon_state *state, daemon_connection *connection,
+        const uint8_t *payload, size_t payload_len, int received_fd,
+        bool sealing, uint8_t record_id[KSEC_RECORD_ID_BYTES],
+        uint64_t *revision, char name[KSEC_MAX_DATASET_NAME + 1U],
+        ksec_owned_record **record_out) {
+    ksec_owned_record *record;
+    ksec_result result;
+    if (state == NULL || connection == NULL || record_id == NULL
+            || name == NULL || record_out == NULL
+            || (sealing && revision == NULL)) {
+        return KSEC_ERR_INVALID;
+    }
+    if (sealing) {
+        result = ksec_dataset_parse_seal_request(payload, payload_len,
+                                                 record_id, revision, name);
+    } else {
+        result = ksec_dataset_parse_unseal_request(payload, payload_len,
+                                                   record_id, name);
+    }
+    if (result != KSEC_OK) return result;
+    if (received_fd < 0) return KSEC_ERR_PROTOCOL;
+    if (!state->unlocked) return KSEC_ERR_LOCKED;
+    record = ksec_store_find(&state->store, record_id);
+    if (record == NULL || record->deleted) return KSEC_ERR_NOT_FOUND;
+    result = authorize_record_raw(connection, KSEC_VERB_USE, record);
+    if (result != KSEC_OK) return result;
+    state->last_authorized_use = ksec_now_seconds();
+    if (ksec_validate_dataset_key_record(record) != KSEC_OK) {
+        return KSEC_ERR_INVALID;
+    }
+    *record_out = record;
+    return KSEC_OK;
+}
+
+static ksec_result fill_dataset_info(ksec_dataset_header_info *info,
+                                     const daemon_state *state,
+                                     const ksec_owned_record *record,
+                                     const char *name, uint64_t revision,
+                                     uint64_t plaintext_length) {
+    size_t owner_len;
+    size_t name_len;
+    if (info == NULL || state == NULL || record == NULL || name == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    owner_len = strlen(record->owner);
+    name_len = strlen(name);
+    if (owner_len == 0U || owner_len > KSEC_MAX_APP_ID
+            || name_len == 0U || name_len > KSEC_MAX_DATASET_NAME
+            || record->fields[0].value.data == NULL
+            || record->fields[0].value.len != KSEC_DATASET_KEY_BYTES) {
+        return KSEC_ERR_INVALID;
+    }
+    memset(info, 0, sizeof *info);
+    memcpy(info->vault_uuid, state->header.vault_uuid, KSEC_UUID_BYTES);
+    memcpy(info->key_record_id, record->id, KSEC_RECORD_ID_BYTES);
+    info->revision = revision;
+    info->plaintext_length = plaintext_length;
+    memcpy(info->owner, record->owner, owner_len + 1U);
+    memcpy(info->name, name, name_len + 1U);
+    return KSEC_OK;
 }
 
 static ksec_result handle_seal(daemon_state *state, daemon_connection *connection,
                                const uint8_t *payload, size_t payload_len,
                                int received_fd, int *reply_fd) {
-    (void)state; (void)connection; (void)payload; (void)payload_len;
-    (void)received_fd; (void)reply_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    ksec_dataset_header_info info;
+    ksec_owned_record *record = NULL;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    char name[KSEC_MAX_DATASET_NAME + 1U];
+    uint64_t revision = 0U;
+    uint64_t plaintext_size = 0U;
+    ksec_result result;
+    memset(&info, 0, sizeof info);
+    memset(record_id, 0, sizeof record_id);
+    memset(name, 0, sizeof name);
+    if (reply_fd == NULL) return KSEC_ERR_INVALID;
+    *reply_fd = -1;
+    result = begin_dataset_use(state, connection, payload, payload_len,
+                               received_fd, true, record_id, &revision, name,
+                               &record);
+    if (result != KSEC_OK) goto out;
+    result = dataset_request_size(received_fd, KSEC_MAX_DATASET_BYTES,
+                                  &plaintext_size);
+    if (result != KSEC_OK) goto out;
+    result = audit_state_event(state, "seal", "begin", connection->uid,
+                               connection->pid, connection->capability->app_id,
+                               record->id);
+    if (result != KSEC_OK) goto out;
+    *reply_fd = memfd_create("ksec-dataset-seal",
+                             MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (*reply_fd < 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = fill_dataset_info(&info, state, record, name, revision,
+                               plaintext_size);
+    if (result != KSEC_OK) goto out;
+    result = ksec_dataset_seal(record->fields[0].value.data, &info,
+                               received_fd, *reply_fd);
+    if (result == KSEC_OK) result = finish_dataset_reply(*reply_fd);
+    if (result != KSEC_OK) goto out;
+    result = audit_state_event(state, "seal", "ok", connection->uid,
+                               connection->pid, connection->capability->app_id,
+                               record->id);
+out:
+    if (result != KSEC_OK) discard_reply(reply_fd);
+    sodium_memzero(&info, sizeof info);
+    sodium_memzero(record_id, sizeof record_id);
+    sodium_memzero(name, sizeof name);
+    return result;
 }
 
 /* On success writes the u64 revision into response[0..8). */
@@ -1701,9 +2045,64 @@ static ksec_result handle_unseal(daemon_state *state,
                                  int received_fd,
                                  uint8_t response[KSEC_RECORD_ID_BYTES],
                                  size_t *response_len, int *reply_fd) {
-    (void)state; (void)connection; (void)payload; (void)payload_len;
-    (void)received_fd; (void)response; (void)response_len; (void)reply_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    ksec_dataset_header_info expected;
+    ksec_dataset_header_info actual;
+    ksec_owned_record *record = NULL;
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    char name[KSEC_MAX_DATASET_NAME + 1U];
+    uint64_t maximum = 0U;
+    uint64_t sealed_size = 0U;
+    ksec_result result;
+    memset(&expected, 0, sizeof expected);
+    memset(&actual, 0, sizeof actual);
+    memset(record_id, 0, sizeof record_id);
+    memset(name, 0, sizeof name);
+    if (response == NULL || response_len == NULL || reply_fd == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    *response_len = 0U;
+    *reply_fd = -1;
+    result = begin_dataset_use(state, connection, payload, payload_len,
+                               received_fd, false, record_id, NULL, name,
+                               &record);
+    if (result != KSEC_OK) goto out;
+    result = dataset_max_sealed_bytes(&maximum);
+    if (result != KSEC_OK) goto out;
+    result = dataset_request_size(received_fd, maximum, &sealed_size);
+    if (result != KSEC_OK) goto out;
+    result = audit_state_event(state, "unseal", "begin", connection->uid,
+                               connection->pid, connection->capability->app_id,
+                               record->id);
+    if (result != KSEC_OK) goto out;
+    *reply_fd = memfd_create("ksec-dataset-unseal",
+                             MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (*reply_fd < 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    result = fill_dataset_info(&expected, state, record, name, 0U, 0U);
+    if (result != KSEC_OK) goto out;
+    result = ksec_dataset_unseal(record->fields[0].value.data, &expected,
+                                 received_fd, *reply_fd, &actual);
+    if (result == KSEC_OK) result = finish_dataset_reply(*reply_fd);
+    if (result != KSEC_OK) goto out;
+    ksec_put_u64(response, actual.revision);
+    *response_len = 8U;
+    result = audit_state_event(state, "unseal", "ok", connection->uid,
+                               connection->pid, connection->capability->app_id,
+                               record->id);
+    if (result != KSEC_OK) *response_len = 0U;
+out:
+    if (result != KSEC_OK) {
+        discard_reply(reply_fd);
+        if (response_len != NULL) *response_len = 0U;
+    }
+    sodium_memzero(&expected, sizeof expected);
+    sodium_memzero(&actual, sizeof actual);
+    sodium_memzero(record_id, sizeof record_id);
+    sodium_memzero(name, sizeof name);
+    (void)sealed_size;
+    return result;
 }
 
 /* ---- Status and watch: operations 26-27 (lane L3). SKELETON stubs. ---- */
@@ -1714,17 +2113,60 @@ static ksec_result handle_status(daemon_state *state,
                                  size_t payload_len, int received_fd,
                                  uint8_t response[KSEC_RECORD_ID_BYTES],
                                  size_t *response_len) {
-    (void)state; (void)connection; (void)payload_len; (void)received_fd;
-    (void)response; (void)response_len;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    uint32_t flags = 0U;
+    ksec_result result;
+    if (state == NULL || connection == NULL || response == NULL
+            || response_len == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    if (payload_len != 0U || received_fd >= 0) return KSEC_ERR_PROTOCOL;
+    result = capability_is_live(connection->capability);
+    if (result != KSEC_OK) return result;
+    if (state->initialized) {
+        flags |= KSEC_STATUS_INITIALIZED;
+        if ((state->header.flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) != 0U) {
+            flags |= KSEC_STATUS_RECOVERY_CONFIRMED;
+        }
+    }
+    if (state->unlocked) flags |= KSEC_STATUS_UNLOCKED;
+    ksec_put_u32(response, KSEC_STATUS_VERSION);
+    ksec_put_u32(response + 4U, flags);
+    *response_len = 8U;
+    return KSEC_OK;
 }
 
 static ksec_result handle_watch(daemon_state *state, daemon_connection *connection,
                                 size_t payload_len, int received_fd,
                                 int *reply_fd) {
-    (void)state; (void)connection; (void)payload_len; (void)received_fd;
-    (void)reply_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    vault_watch *slot = NULL;
+    int pair[2] = {-1, -1};
+    size_t index;
+    ksec_result result;
+    if (state == NULL || connection == NULL || reply_fd == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    if (payload_len != 0U || received_fd >= 0) return KSEC_ERR_PROTOCOL;
+    result = capability_is_live(connection->capability);
+    if (result != KSEC_OK) return result;
+    if (!state->unlocked) return KSEC_ERR_LOCKED;
+    if (watch_count(state) >= KSEC_MAX_WATCHES) return KSEC_ERR_LIMIT;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        if (!state->watches[index].active) {
+            slot = &state->watches[index];
+            break;
+        }
+    }
+    if (slot == NULL) return KSEC_ERR_LIMIT;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) {
+        return KSEC_ERR_IO;
+    }
+    memset(slot, 0, sizeof *slot);
+    slot->active = true;
+    slot->daemon_fd = pair[0];
+    slot->connection_fd = connection->fd;
+    slot->capability = connection->capability;
+    *reply_fd = pair[1];
+    return KSEC_OK;
 }
 
 static ksec_result handle_doctor(daemon_state *state, daemon_connection *connection,
@@ -1976,6 +2418,7 @@ static int accept_connection(int listener, daemon_connection *connection) {
 static void close_connection(daemon_state *state, daemon_connection *connection) {
     if (connection->fd >= 0) {
         invalidate_connection_identity_leases(state, connection->fd);
+        invalidate_connection_watches(state, connection->fd);
         ksec_policy_disconnect(&state->policy, connection->fd);
         (void)close(connection->fd);
     }
@@ -2021,6 +2464,7 @@ static int serve(int listener, daemon_state *state) {
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) return -1;
         expire_identity_leases(state);
+        expire_watches(state);
         if ((pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
                 || ksec_session_monitor_process(state->session_monitor) != 0) {
             lock_state(state);
