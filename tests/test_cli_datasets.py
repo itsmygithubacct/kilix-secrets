@@ -78,10 +78,14 @@ def run_cli(cli: Path, socket_path: Path, app_id: str, arguments: list[str],
         command.extend(["--secret-fd", str(descriptor)])
         forwarded = (*pass_fds, descriptor)
     try:
+        if stdin is None:
+            return subprocess.run(
+                command, check=False, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=forwarded, timeout=30,
+            )
         return subprocess.run(
-            command, check=False,
-            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
-            input=None if stdin is None else stdin,
+            command, check=False, input=stdin,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             pass_fds=forwarded, timeout=30,
         )
@@ -196,7 +200,7 @@ def run_unseal_on_terminal(cli: Path, socket_path: Path, app_id: str,
     try:
         completed = subprocess.run(
             [str(cli), "--socket", str(socket_path), "--app", app_id, *arguments],
-            check=False, stdin=subprocess.PIPE, input=stdin, stdout=slave,
+            check=False, input=stdin, stdout=slave,
             stderr=subprocess.PIPE, timeout=30,
         )
         return completed.returncode, read_pty(master), completed.stderr
