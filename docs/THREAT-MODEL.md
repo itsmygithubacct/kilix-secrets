@@ -105,6 +105,15 @@ revision, and the application must compare it with the revision it expects.
 Deleting a dataset key, or a destructive reset, makes every file sealed under
 it permanently unreadable.
 
+Each SEAL or UNSEAL reply is a memfd of up to about 64 MiB that lives in the
+socket queue until the client reads it. The daemon refuses SEAL and UNSEAL with
+`KSEC_ERR_BUSY` while the requesting connection still has an unread reply, so
+unread dataset replies are bounded at one per connection: 64 x about 64 MiB,
+roughly 4 GiB of shared memory charged to the daemon's cgroup in the worst
+case. That memory is shared memory, not daemon RSS, so the 8,192 KiB RSS bound
+above does not cover it. A same-UID process can exhaust tmpfs on its own, so
+this is a resource bound, not a privilege boundary.
+
 A daemon built before this amendment refuses to load a vault that contains a
 dataset key. That is fail-closed: no record is removed or rewritten, and the
 amended daemon loads the vault again.

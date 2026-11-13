@@ -106,7 +106,8 @@ DATASET_CREATE: payload grammar → unlocked → `authorize(create, own app)` �
 record-count limit (`KSEC_ERR_LIMIT`) → audit `dataset-create begin` →
 append → audit `ok`.
 
-SEAL and UNSEAL: payload grammar → descriptor present → unlocked → record
+SEAL and UNSEAL: payload grammar → descriptor present → the connection has
+no unread reply (`KSEC_ERR_BUSY`; review amendment 1, §10) → unlocked → record
 exists and not deleted (`NOT_FOUND`) → `authorize_record_raw(use)` (`DENIED`)
 → record is a valid dataset key, else `KSEC_ERR_INVALID` → descriptor seals
 and size → audit `seal`/`unseal begin` → work → audit `ok`.
@@ -219,8 +220,11 @@ ksec_result ksec_watch(ksec_client *client, int *watch_fd);
   descriptor: file, pipe) to end of file into a client-made sealed memfd,
   bounded by the limits in §3.1 (`KSEC_ERR_LIMIT` beyond), send it, and write
   the reply descriptor's bytes sequentially to `output_fd` **only after the
-  daemon has returned `KSEC_OK`**. On any failure nothing is written to
-  `output_fd`. A caller writes to a temporary file and renames.
+  daemon has returned `KSEC_OK`**. On any failure the daemon reports, nothing
+  is written to `output_fd`. If writing the reply to `output_fd` itself fails
+  (`KSEC_ERR_IO`, for example `ENOSPC` or `EPIPE`), `output_fd` may hold a
+  prefix of the output (review amendment 2, §10). A caller writes to a
+  temporary file and renames.
 - `ksec_status` returns the flags; a reply whose version is not 1 is
   `KSEC_ERR_PROTOCOL`.
 - `ksec_watch` returns a close-on-exec, nonblocking descriptor.
@@ -319,3 +323,21 @@ and framed binary inputs.
 Format v1 record encoding, slots, header, journal and backup v1 bytes; the
 existing vectors; operations 1–22; capability rules; the 1,024-record and
 128 MiB journal limits; the threat model's same-UID boundary.
+
+## 10. Amendments after independent review (2026-11-13)
+
+Made by the supervisor after review seat B (`reviews/REVIEW-B.md`, findings
+B-3 and B-5). Neither changes the file format, the vectors or operations
+1–22.
+
+1. **Unread replies (B-3).** Each SEAL and UNSEAL reply is a memfd of up to
+   about 64 MiB that stays in the socket queue until the client reads it. A
+   client that pipelines requests without reading could make the daemon pin
+   one such memfd per request. The daemon now refuses SEAL and UNSEAL with
+   `KSEC_ERR_BUSY` while the requesting connection has an unread reply
+   (`ioctl(SIOCOUTQ)` greater than zero), checked right after the descriptor is
+   found present. Unread dataset replies are therefore bounded at one per
+   connection, 64 in total.
+2. **Partial output (B-5).** The client cannot take back bytes already written
+   to a pipe or a full disk, so a write failure after `KSEC_OK` may leave a
+   prefix in `output_fd`. The call still returns `KSEC_ERR_IO`.
