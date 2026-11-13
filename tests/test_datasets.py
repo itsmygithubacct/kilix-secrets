@@ -25,11 +25,12 @@ OTHER = "other-app"
 NAME = "ledger"
 MARKER = b"KILIX-DATASET-MARKER-7f3a"
 SENTINEL = b"UNTOUCHED-OUTPUT"
-# Exact sealed lengths for owner "kilix-secrets.test" (19) and name "ledger" (6).
-SEALED_0 = 134
-SEALED_1 = 135
-SEALED_1MIB = 1048965
-SEALED_64MIB = 67126389
+# Exact sealed lengths for owner "kilix-secrets.test" (18) and name "ledger" (6):
+# 92 + 18 + 6 + L + 17*k, with k = max(1, ceil(L/65536)).
+SEALED_0 = 133
+SEALED_1 = 134
+SEALED_1MIB = 1048964
+SEALED_64MIB = 67126388
 UNSEAL_MAX = 67126556
 
 
@@ -756,3 +757,7 @@ def main() -> int:
         wipe(reset_recovery)
         remove_tree(fill_root, scratch)
         remove_tree(root, scratch)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
