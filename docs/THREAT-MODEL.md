@@ -81,3 +81,30 @@ Clipboard copy is opt-in and uses the active Kitty clipboard provider. Secret
 bytes travel on provider standard input, never argv or environment. Timed
 clearing occurs only after byte-exact read-back still matches; clipboard
 history and another client's retained copy cannot be erased or guaranteed.
+
+## Sealed datasets
+
+A sealed dataset file (`docs/SEALED-DATASETS.md`) is protected at rest by a
+32-byte dataset key that never leaves the daemon: neither the owning
+application, nor a granted application, nor the administrative CLI can read
+it, and the generic read, replace, grant and revoke paths refuse the object
+class. While the vault is locked, and on any machine without the vault, the
+file is unreadable. Chunks are authenticated with the complete header prefix,
+so a file cannot be truncated, extended, reordered, moved to another dataset
+name, attributed to another owner or key, or opened under another vault UUID
+without detection.
+
+The same honest limits apply as for records. While the vault is unlocked, any
+process running as the user that can obtain a capability under the owning
+application ID can ask the daemon to unseal the file; the application-ID
+boundary is cooperative. Plaintext returned to the application, and the reply
+memfd that carries it, are outside the daemon's locking and clearing. The
+daemon does not prevent rollback of a sealed file: an older file of the same
+dataset, sealed under the same key, still unseals and reports its older
+revision, and the application must compare it with the revision it expects.
+Deleting a dataset key, or a destructive reset, makes every file sealed under
+it permanently unreadable.
+
+A daemon built before this amendment refuses to load a vault that contains a
+dataset key. That is fail-closed: no record is removed or rewritten, and the
+amended daemon loads the vault again.

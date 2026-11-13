@@ -103,3 +103,16 @@ supervisor deliberately passes one capability descriptor to its exact child.
 The identity descriptor is the sole combined delivery/lease exception: its
 fixed initial frame contains the private key and is consumed inside the client
 library before the descriptor is returned to the caller.
+
+## Sealed dataset operations 23–25
+
+The frozen contract is `docs/SEALED-DATASETS.md` sections 2–4.
+
+PLACEHOLDER (lane L2): final protocol text for `DATASET_CREATE`, `SEAL` and
+`UNSEAL`.
+
+## Status and watch operations 26–27
+
+The frozen contract is `docs/SEALED-DATASETS.md` section 3.
+
+PLACEHOLDER (lane L3): final protocol text for `STATUS` and `WATCH`.

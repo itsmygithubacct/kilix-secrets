@@ -24,6 +24,16 @@ extern "C" {
 #define KSEC_IDENTITY_TYPE "device-identity"
 #define KSEC_IDENTITY_PRIVATE_FIELD "private-key"
 #define KSEC_RESET_CONFIRMATION "RESET-VAULT-AND-LOSE-IDENTITY"
+/* Sealed datasets, status and watch: docs/SEALED-DATASETS.md. */
+#define KSEC_DATASET_KEY_TYPE "dataset-key"
+#define KSEC_DATASET_KEY_FIELD "dataset-key"
+#define KSEC_DATASET_KEY_BYTES 32U
+#define KSEC_MAX_DATASET_NAME 128U
+#define KSEC_MAX_DATASET_BYTES (64U * 1024U * 1024U)
+#define KSEC_STATUS_VERSION 1U
+#define KSEC_STATUS_INITIALIZED 1U
+#define KSEC_STATUS_RECOVERY_CONFIRMED 2U
+#define KSEC_STATUS_UNLOCKED 4U
 
 typedef struct ksec_client ksec_client;
 
@@ -176,6 +186,26 @@ ksec_result ksec_revoke_record(
         const char *application_id);
 ksec_result ksec_doctor_to_fd(ksec_client *client, int output_fd);
 ksec_result ksec_compact(ksec_client *client);
+
+/*
+ * Sealed datasets (docs/SEALED-DATASETS.md). The dataset key never leaves
+ * the daemon. Seal and unseal read input_fd to end of file and write
+ * output_fd only after the daemon returned KSEC_OK.
+ */
+ksec_result ksec_dataset_create(ksec_client *client, const char *label,
+                                uint8_t record_id[KSEC_RECORD_ID_BYTES]);
+ksec_result ksec_seal_fd(ksec_client *client,
+                         const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                         const char *dataset_name, uint64_t revision,
+                         int input_fd, int output_fd);
+ksec_result ksec_unseal_fd(ksec_client *client,
+                           const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                           const char *dataset_name, int input_fd,
+                           int output_fd, uint64_t *revision);
+/* Vault state flags (KSEC_STATUS_*); works while locked. */
+ksec_result ksec_status(ksec_client *client, uint32_t *flags);
+/* Descriptor that hangs up when the vault locks or the capability ends. */
+ksec_result ksec_watch(ksec_client *client, int *watch_fd);
 
 #ifdef __cplusplus
 }

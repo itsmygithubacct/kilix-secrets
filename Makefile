@@ -28,6 +28,7 @@ LIB_SOURCES := \
 	src/policy.c \
 	src/audit.c \
 	src/backup.c \
+	src/dataset.c \
 	src/protocol.c \
 	src/client.c
 LIB_OBJECTS := $(LIB_SOURCES:src/%.c=$(BUILD)/%.o)
@@ -93,19 +94,42 @@ $(BUILD)/identity-helper: tests/identity_helper.c $(BUILD)/libkilix-secrets.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
 		$(BUILD)/libkilix-secrets.a $(LDLIBS)
 
+$(BUILD)/test-dataset: tests/test_dataset.c $(LIB_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKSEC_TESTING $(LDFLAGS) -o $@ $< \
+		$(LIB_SOURCES) $(LDLIBS)
+
+$(BUILD)/generate-dataset-vectors: tools/generate_dataset_vectors.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
+$(BUILD)/dataset-helper: tests/dataset_helper.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
+$(BUILD)/status-helper: tests/status_helper.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
+$(BUILD)/record-helper: tests/record_helper.c $(BUILD)/libkilix-secrets.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
+		$(BUILD)/libkilix-secrets.a $(LDLIBS)
+
 $(BUILD)/parser-harness: tests/parser_harness.c $(BUILD)/libkilix-secrets.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< \
 		$(BUILD)/libkilix-secrets.a $(LDLIBS)
 
 test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
 	$(BUILD)/test-serve-guard $(BUILD)/test-session $(BUILD)/identity-helper $(BUILD)/generate-vectors \
-	$(BUILD)/parser-harness
+	$(BUILD)/parser-harness $(BUILD)/test-dataset $(BUILD)/generate-dataset-vectors \
+	$(BUILD)/dataset-helper $(BUILD)/status-helper $(BUILD)/record-helper
 	test -d "$(TEST_TMPDIR)" && test ! -L "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-unit
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-crash
 	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-serve-guard
 	$(BUILD)/generate-vectors | cmp - tests/vectors/full-v1.txt
 	$(BUILD)/test-vectors
+	TMPDIR="$(TEST_TMPDIR)" $(BUILD)/test-dataset
+	$(BUILD)/generate-dataset-vectors | cmp - tests/vectors/dataset-v1.txt
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/run_session_harness.py --binary $(BUILD)/test-session
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
@@ -116,6 +140,18 @@ test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
 		python3 tests/test_limits.py --build-dir $(BUILD)
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_activation.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_line_endings.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_datasets.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_status_watch.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_cli_datasets.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_python_binding.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_dataset_limits.py --build-dir $(BUILD)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/check_manifests.py
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/run_negative_corpus.py \
 		--build-dir $(BUILD) --cases 4096

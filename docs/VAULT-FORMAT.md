@@ -104,3 +104,16 @@ byte-identical.
 The portable journal can identify a torn final record but never accepts an
 authentication failure in a complete earlier record. A damaged file is retained
 for explicit recovery. Whole-file offline rollback is not prevented.
+
+## Dataset key records (object type 4)
+
+The frozen contract is `docs/SEALED-DATASETS.md` section 2.
+
+PLACEHOLDER (lane L1): final format-registry text for object type 4.
+
+## Sealed dataset file v1
+
+The frozen contract is `docs/SEALED-DATASETS.md` section 4.
+
+PLACEHOLDER (lane L1): final byte layout, associated data, chunking and the
+`tests/vectors/dataset-v1.txt` vector description.

@@ -1652,6 +1652,58 @@ out:
     return result;
 }
 
+/* ---- Sealed datasets: operations 23-25 (lane L2). SKELETON stubs. ---- */
+
+static ksec_result handle_dataset_create(
+        daemon_state *state, daemon_connection *connection,
+        const uint8_t *payload, size_t payload_len, int received_fd,
+        uint8_t response_id[KSEC_RECORD_ID_BYTES]) {
+    (void)state; (void)connection; (void)payload; (void)payload_len;
+    (void)received_fd; (void)response_id;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+static ksec_result handle_seal(daemon_state *state, daemon_connection *connection,
+                               const uint8_t *payload, size_t payload_len,
+                               int received_fd, int *reply_fd) {
+    (void)state; (void)connection; (void)payload; (void)payload_len;
+    (void)received_fd; (void)reply_fd;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+/* On success writes the u64 revision into response[0..8). */
+static ksec_result handle_unseal(daemon_state *state,
+                                 daemon_connection *connection,
+                                 const uint8_t *payload, size_t payload_len,
+                                 int received_fd,
+                                 uint8_t response[KSEC_RECORD_ID_BYTES],
+                                 size_t *response_len, int *reply_fd) {
+    (void)state; (void)connection; (void)payload; (void)payload_len;
+    (void)received_fd; (void)response; (void)response_len; (void)reply_fd;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+/* ---- Status and watch: operations 26-27 (lane L3). SKELETON stubs. ---- */
+
+/* On success writes u32 version, u32 flags into response[0..8). */
+static ksec_result handle_status(daemon_state *state,
+                                 daemon_connection *connection,
+                                 size_t payload_len, int received_fd,
+                                 uint8_t response[KSEC_RECORD_ID_BYTES],
+                                 size_t *response_len) {
+    (void)state; (void)connection; (void)payload_len; (void)received_fd;
+    (void)response; (void)response_len;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+}
+
+static ksec_result handle_watch(daemon_state *state, daemon_connection *connection,
+                                size_t payload_len, int received_fd,
+                                int *reply_fd) {
+    (void)state; (void)connection; (void)payload_len; (void)received_fd;
+    (void)reply_fd;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+}
+
 static ksec_result handle_doctor(daemon_state *state, daemon_connection *connection,
                                  size_t payload_len, int received_fd, int *reply_fd) {
     char report[512];
@@ -1801,6 +1853,25 @@ static ksec_result dispatch_request(daemon_state *state, daemon_connection *conn
             return handle_identity_info(state, connection, payload,
                                         request->payload_len, received_fd,
                                         reply_fd);
+        case KSEC_OP_DATASET_CREATE:
+            result = handle_dataset_create(state, connection, payload,
+                                           request->payload_len, received_fd,
+                                           response_id);
+            if (result == KSEC_OK) *response_len = KSEC_RECORD_ID_BYTES;
+            return result;
+        case KSEC_OP_SEAL:
+            return handle_seal(state, connection, payload, request->payload_len,
+                               received_fd, reply_fd);
+        case KSEC_OP_UNSEAL:
+            return handle_unseal(state, connection, payload,
+                                 request->payload_len, received_fd,
+                                 response_id, response_len, reply_fd);
+        case KSEC_OP_STATUS:
+            return handle_status(state, connection, request->payload_len,
+                                 received_fd, response_id, response_len);
+        case KSEC_OP_WATCH:
+            return handle_watch(state, connection, request->payload_len,
+                                received_fd, reply_fd);
         default:
             return KSEC_ERR_PROTOCOL;
     }

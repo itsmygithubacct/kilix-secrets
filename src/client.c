@@ -947,3 +947,41 @@ ksec_result ksec_compact(ksec_client *client) {
                                         response, sizeof response, &length);
     return result == KSEC_OK && length != 0U ? KSEC_ERR_PROTOCOL : result;
 }
+
+/* ---- Sealed datasets: client side (lane L2). SKELETON stubs. ---- */
+
+ksec_result ksec_dataset_create(ksec_client *client, const char *label,
+                                uint8_t record_id[KSEC_RECORD_ID_BYTES]) {
+    (void)client; (void)label; (void)record_id;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+ksec_result ksec_seal_fd(ksec_client *client,
+                         const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                         const char *dataset_name, uint64_t revision,
+                         int input_fd, int output_fd) {
+    (void)client; (void)record_id; (void)dataset_name; (void)revision;
+    (void)input_fd; (void)output_fd;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+ksec_result ksec_unseal_fd(ksec_client *client,
+                           const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                           const char *dataset_name, int input_fd,
+                           int output_fd, uint64_t *revision) {
+    (void)client; (void)record_id; (void)dataset_name; (void)input_fd;
+    (void)output_fd; (void)revision;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+}
+
+/* ---- Status and watch: client side (lane L3). SKELETON stubs. ---- */
+
+ksec_result ksec_status(ksec_client *client, uint32_t *flags) {
+    (void)client; (void)flags;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+}
+
+ksec_result ksec_watch(ksec_client *client, int *watch_fd) {
+    (void)client; (void)watch_fd;
+    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+}

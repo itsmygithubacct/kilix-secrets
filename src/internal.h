@@ -19,6 +19,7 @@
 #define KSEC_OBJECT_SECRET 1U
 #define KSEC_OBJECT_DEVICE_IDENTITY 2U
 #define KSEC_OBJECT_BACKUP_METADATA 3U
+#define KSEC_OBJECT_DATASET_KEY 4U
 #define KSEC_HEADER_FLAG_RECOVERY_CONFIRMED 1U
 
 #define KSEC_UUID_BYTES 16U
@@ -76,6 +77,18 @@ typedef struct ksec_argon_observation {
 #define KSEC_IDENTITY_FRAME_BYTES 144U
 #define KSEC_IDENTITY_INFO_FRAME_MAGIC UINT32_C(0x4b534950)
 #define KSEC_IDENTITY_INFO_FRAME_BYTES 112U
+
+/* Sealed dataset file v1 (docs/SEALED-DATASETS.md section 4). */
+#define KSEC_DATASET_MAGIC "KSDSET01"
+#define KSEC_DATASET_FORMAT_VERSION 1U
+#define KSEC_DATASET_STREAM_ID 1U
+#define KSEC_DATASET_CHUNK_BYTES 65536U
+#define KSEC_DATASET_KDF_CONTEXT "KSDSET01"
+#define KSEC_DATASET_KDF_SUBKEY_ID 1U
+#define KSEC_DATASET_STREAM_HEADER_BYTES 24U
+#define KSEC_DATASET_CHUNK_OVERHEAD 17U
+#define KSEC_DATASET_PREFIX_FIXED_BYTES 68U
+#define KSEC_MAX_WATCHES 128U
 
 #define KSEC_GRANTABLE_VERBS \
     ((uint32_t)(KSEC_VERB_READ | KSEC_VERB_REPLACE | KSEC_VERB_DELETE \
@@ -203,7 +216,12 @@ typedef enum {
     KSEC_OP_RESET_VAULT = 20,
     KSEC_OP_IDENTITY_OPEN = 21,
     KSEC_OP_IDENTITY_INFO = 22,
-    KSEC_OP_MAX = KSEC_OP_IDENTITY_INFO
+    KSEC_OP_DATASET_CREATE = 23,
+    KSEC_OP_SEAL = 24,
+    KSEC_OP_UNSEAL = 25,
+    KSEC_OP_STATUS = 26,
+    KSEC_OP_WATCH = 27,
+    KSEC_OP_MAX = KSEC_OP_WATCH
 } ksec_operation;
 
 typedef struct {
@@ -434,6 +452,45 @@ ksec_result ksec_backup_validate_envelope_header(
         const uint8_t *header, size_t header_len, uint64_t artifact_len,
         uint32_t *vault_len, uint64_t *journal_len);
 void ksec_backup_image_clear(ksec_backup_image *image);
+
+/* Sealed datasets: src/dataset.c, docs/SEALED-DATASETS.md section 5. */
+typedef struct {
+    uint8_t vault_uuid[KSEC_UUID_BYTES];
+    uint8_t key_record_id[KSEC_RECORD_ID_BYTES];
+    uint64_t revision;
+    uint64_t plaintext_length;
+    char owner[KSEC_MAX_APP_ID + 1U];
+    char name[KSEC_MAX_DATASET_NAME + 1U];
+} ksec_dataset_header_info;
+
+ksec_result ksec_dataset_encode_prefix(const ksec_dataset_header_info *info,
+                                       uint8_t *output, size_t output_size,
+                                       size_t *output_length);
+ksec_result ksec_dataset_parse_prefix(const uint8_t *input, size_t input_length,
+                                      ksec_dataset_header_info *info,
+                                      size_t *prefix_length);
+ksec_result ksec_dataset_sealed_length(uint64_t plaintext_length,
+                                       size_t prefix_length,
+                                       uint64_t *sealed_length);
+ksec_result ksec_dataset_seal(const uint8_t key[KSEC_DATASET_KEY_BYTES],
+                              const ksec_dataset_header_info *info,
+                              int plaintext_fd, int output_fd);
+ksec_result ksec_dataset_unseal(const uint8_t key[KSEC_DATASET_KEY_BYTES],
+                                const ksec_dataset_header_info *expected,
+                                int sealed_fd, int output_fd,
+                                ksec_dataset_header_info *actual);
+ksec_result ksec_dataset_parse_create_request(const uint8_t *payload,
+                                              size_t payload_length,
+                                              char label[KSEC_MAX_LABEL + 1U]);
+ksec_result ksec_dataset_parse_seal_request(
+        const uint8_t *payload, size_t payload_length,
+        uint8_t record_id[KSEC_RECORD_ID_BYTES], uint64_t *revision,
+        char name[KSEC_MAX_DATASET_NAME + 1U]);
+ksec_result ksec_dataset_parse_unseal_request(
+        const uint8_t *payload, size_t payload_length,
+        uint8_t record_id[KSEC_RECORD_ID_BYTES],
+        char name[KSEC_MAX_DATASET_NAME + 1U]);
+ksec_result ksec_validate_dataset_key_record(const ksec_owned_record *record);
 
 ksec_result ksec_packet_encode(const ksec_packet_header *header,
                                const uint8_t *payload, uint8_t *output,
