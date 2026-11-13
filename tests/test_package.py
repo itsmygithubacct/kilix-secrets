@@ -81,12 +81,18 @@ def main() -> int:
         "share/doc/kilix-secrets/THIRD_PARTY_NOTICES.md",
         "share/doc/kilix-secrets/DEPENDENCIES.md",
         "share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md",
+        "lib/python3/dist-packages/kilix_secrets/__init__.py",
+        "lib/python3/dist-packages/kilix_secrets/_binding.py",
+        "lib/python3/dist-packages/kilix_secrets/_files.py",
+        "lib/python3/dist-packages/kilix_secrets/_protocol.py",
+        "lib/python3/dist-packages/kilix_secrets/_session.py",
+        "lib/python3/dist-packages/kilix_secrets/worker.py",
     }
     try:
         installed = run_make(source, "install", build, stage)
         first = snapshot(prefix)
         checks.check(installed.returncode == 0 and set(first) == expected,
-                     "staged install produces the exact 13/13-file manifest")
+                     "staged install produces the exact 19/19-file manifest")
         checks.check(first.get("lib/libkilix-secrets.so", ("", 0, ""))[0]
                      == "link"
                      and first["lib/libkilix-secrets.so"][2]
@@ -97,7 +103,10 @@ def main() -> int:
                      or name == "lib/libkilix-secrets.so.0" else 0o644)
             for name, (kind, mode, _) in first.items() if kind == "file"
         )
-        checks.check(modes_ok, "all 12/12 installed regular-file modes are exact")
+        checks.check(modes_ok, "all 18/18 installed regular-file modes are exact")
+        pc_text = (prefix / "lib/pkgconfig/kilix-secrets.pc").read_text(encoding="ascii")
+        checks.check("\nVersion: 0.2.0\n" in f"\n{pc_text}",
+                     "installed pkg-config version is 0.2.0")
 
         needed_daemon = subprocess.run(
             ["readelf", "-d", str(prefix / "bin/kilix-secretsd")],
@@ -185,7 +194,7 @@ def main() -> int:
         vault_path.chmod(0o600)
         uninstalled = run_make(source, "uninstall", build, stage)
         checks.check(uninstalled.returncode == 0 and snapshot(prefix) == {},
-                     "uninstall removes 13/13 package files from the staged prefix")
+                     "uninstall removes 19/19 package files from the staged prefix")
         checks.check(vault_path.read_bytes() == vault_bytes,
                      "uninstall preserves the 1/1 synthetic user vault by default")
 

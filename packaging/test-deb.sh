@@ -21,8 +21,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-version_a=0.1.0~package-test-1
-version_b=0.1.0~package-test-2
+version_a=0.2.0~package-test-1
+version_b=0.2.0~package-test-2
 mkdir -p "$scratch/a" "$scratch/a-rebuilt" "$scratch/b" \
     "$scratch/cross" "$scratch/root"
 TMPDIR=$tmp_root OUTPUT_DIR=$scratch/a PACKAGE_VERSION=$version_a ALLOW_DIRTY=1 \
@@ -73,6 +73,13 @@ test -f "$scratch/root/usr/include/kilix_secrets.h"
 test -f "$scratch/root/usr/lib/$multiarch/pkgconfig/kilix-secrets.pc"
 grep -qx "libdir=\${exec_prefix}/lib/$multiarch" \
     "$scratch/root/usr/lib/$multiarch/pkgconfig/kilix-secrets.pc"
+grep -qx 'Version: 0.2.0' \
+    "$scratch/root/usr/lib/$multiarch/pkgconfig/kilix-secrets.pc"
+python_pkg=$scratch/root/usr/lib/python3/dist-packages/kilix_secrets
+for module in __init__.py _binding.py _files.py _protocol.py _session.py worker.py; do
+    test -f "$python_pkg/$module"
+done
+printf 'Python package: 6/6 modules in the Debian payload\n'
 grep -qx 'ExecStart=/usr/bin/kilix-secretsd --systemd --data-dir %h/.local/share/kilix-secrets' \
     "$scratch/root/usr/lib/systemd/user/kilix-secrets.service"
 if grep -R -n -E --binary-files=without-match \
@@ -127,6 +134,7 @@ test "$(dpkg-query --admindir="$admin_dir" -W -f='${Version}' kilix-secrets)" = 
 dpkg --root="$dpkg_root" --log="$dpkg_log" --force-not-root \
     --remove kilix-secrets >/dev/null 2>>"$dpkg_warnings"
 test ! -e "$dpkg_root/usr/bin/kilix-secrets"
+test ! -e "$dpkg_root/usr/lib/python3/dist-packages/kilix_secrets/__init__.py"
 test "$(cat "$vault")" = 'KSV-SYNTHETIC-ENCRYPTED-PRESERVATION-FIXTURE'
 dpkg --root="$dpkg_root" --log="$dpkg_log" --force-not-root --force-depends \
     --install "$package_b" >/dev/null 2>>"$dpkg_warnings"
