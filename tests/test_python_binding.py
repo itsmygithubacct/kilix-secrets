@@ -18,10 +18,6 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_PARENT = ROOT / "python"
-MARKERS = Path(
-    "/home/pleb/research/gpu_terminal/kilix-modules/kilix-secrets/"
-    "sealed-datasets-20261113/integration"
-)
 
 APP = "kilix-secrets.test"
 PEER = "kilix-secrets.peer"
@@ -709,8 +705,6 @@ def test_vault(checks: Checks, socket_path: Path) -> None:
         Invalid, LimitExceeded, Locked, NotFound, ProtocolError, Record, Session,
         Slot, Status, Verb, Watcher, mint_for_child, zero,
     )
-    need_l2 = (MARKERS / "MERGED-L2").is_file()
-    need_l3 = (MARKERS / "MERGED-L3").is_file()
     session = Session(str(socket_path), APP, Verb.ALL, 300)
     peer = None
     reader = None
@@ -926,17 +920,10 @@ def test_vault(checks: Checks, socket_path: Path) -> None:
         checks.check(imported_secret == SECRET_V2, "import restores py-secret-value-v2")
         zero(imported_secret)
 
-        if need_l2:
-            test_datasets(checks, session)
-        else:
-            expect(checks, ProtocolError, "protocol failure",
-                   lambda: session.dataset_create("py-dataset"))
-        if need_l3:
-            checks.check(session.status() == 7,
-                         "status is initialized, recovery-confirmed, and unlocked")
-            watcher = test_watcher(checks, socket_path, session)
-        else:
-            expect(checks, ProtocolError, "protocol failure", lambda: session.status())
+        test_datasets(checks, session)
+        checks.check(session.status() == 7,
+                     "status is initialized, recovery-confirmed, and unlocked")
+        watcher = test_watcher(checks, socket_path, session)
         expect(checks, Invalid, "invalid input",
                lambda: session.reset_vault("RESET-VAULT-WITHOUT-IDENTITY-LOSS", PASS_V3))
         new_recovery = session.reset_vault("RESET-VAULT-AND-LOSE-IDENTITY", PASS_V3)
@@ -1065,6 +1052,64 @@ def _expiring_seal_round_trip(checks: Checks, session, record_id: bytes, root: P
     checks.check(ok, f"expiring seal_file round-trips the fifo plaintext ({detail})")
 
 
+def _forced_retry_round_trip(checks: Checks, session, record_id: bytes, root: Path) -> None:
+    """Take Session._call's retry branch on purpose (review B2-2).
+
+    The checks above read the slow input before the call, so the Session
+    rotates its worker first and never retries. Here pre-call rotation is
+    switched off and the capability is left to expire, so the first attempt
+    is refused after the C client has read the input snapshot to end of file.
+    The retry must send the snapshot again from offset 0.
+    """
+    from kilix_secrets import Session, Verb
+    plain = b"forced-retry-" + os.urandom(48 * 1024)
+    source = root / "forced-retry.plain"
+    source.write_bytes(plain)
+    sealed = root / "forced-retry.sealed"
+    opened = root / "forced-retry.opened"
+    short = Session(session._socket_path, APP, Verb.ALL, lifetime=2)
+    short._ensure_worker = lambda: None
+    attempts: list[tuple[str, bool]] = []
+    real_attempt = short._attempt
+
+    def counting(method, fields, factory):
+        reply, out = real_attempt(method, fields, factory)
+        attempts.append((method, bool(reply.get("ok"))))
+        return reply, out
+
+    short._attempt = counting
+    results = {}
+    try:
+        for method in ("seal_fd", "unseal_fd"):
+            time.sleep(3.2)
+            attempts.clear()
+            src = os.open(source if method == "seal_fd" else sealed, os.O_RDONLY | os.O_CLOEXEC)
+            dst = os.open(sealed if method == "seal_fd" else opened,
+                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            try:
+                if method == "seal_fd":
+                    short.seal_fd(record_id, "forced-retry", 11, src, dst)
+                    value = None
+                else:
+                    value = short.unseal_fd(record_id, "forced-retry", src, dst)
+                results[method] = (list(attempts), value, None)
+            except Exception as exc:
+                results[method] = (list(attempts), None, f"{type(exc).__name__}: {exc}")
+            finally:
+                os.close(src)
+                os.close(dst)
+    finally:
+        short.close()
+    for method, expected_value in (("seal_fd", None), ("unseal_fd", 11)):
+        tried, value, error = results.get(method, ([], None, "not run"))
+        checks.check(tried == [(method, False), (method, True)] and error is None
+                     and value == expected_value,
+                     f"{method} retries once after expiry ({tried}, {value}, {error})")
+    got = opened.read_bytes() if opened.exists() else b""
+    checks.check(got == plain,
+                 f"forced-retry seal and unseal round-trip the plaintext ({len(got)} of {len(plain)})")
+
+
 def test_datasets(checks: Checks, session) -> None:
     from kilix_secrets import Denied, NotFound, Verb, Session
     record_id = session.dataset_create("py-dataset")
@@ -1106,6 +1151,7 @@ def test_datasets(checks: Checks, session) -> None:
             reader.close()
         _rejected_seal_arguments(checks, session, record_id, root)
         _expiring_seal_round_trip(checks, session, record_id, root)
+        _forced_retry_round_trip(checks, session, record_id, root)
         session.delete(record_id)
         missing = root / "missing"
         expect(checks, NotFound, "not found",
