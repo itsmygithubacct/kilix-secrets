@@ -948,30 +948,209 @@ ksec_result ksec_compact(ksec_client *client) {
     return result == KSEC_OK && length != 0U ? KSEC_ERR_PROTOCOL : result;
 }
 
-/* ---- Sealed datasets: client side (lane L2). SKELETON stubs. ---- */
+/* ---- Sealed datasets: client side (lane L2). ---- */
+
+static ksec_result dataset_max_sealed_bytes(uint64_t *maximum) {
+    if (maximum == NULL) return KSEC_ERR_INVALID;
+    return ksec_dataset_sealed_length(
+            KSEC_MAX_DATASET_BYTES,
+            (size_t)KSEC_DATASET_PREFIX_FIXED_BYTES
+                + (size_t)KSEC_MAX_APP_ID
+                + (size_t)KSEC_MAX_DATASET_NAME,
+            maximum);
+}
+
+/*
+ * Read input_fd to EOF into a fresh memfd and seal it. Stop at maximum and
+ * return LIMIT without sending. The buffer is wiped before return.
+ */
+static ksec_result read_input_sealed_memfd(int input_fd, uint64_t maximum,
+                                           int *out_fd) {
+    ksec_secure_buffer chunk = {0};
+    int fd = -1;
+    uint64_t total = 0U;
+    ksec_result result;
+    if (input_fd < 0 || out_fd == NULL || maximum == 0U) return KSEC_ERR_INVALID;
+    result = ksec_secure_alloc(&chunk, KSEC_DATASET_CHUNK_BYTES);
+    if (result != KSEC_OK) return result;
+    fd = memfd_create("ksec-dataset-request", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    for (;;) {
+        ssize_t count = read(input_fd, chunk.data, chunk.len);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            result = KSEC_ERR_IO;
+            goto out;
+        }
+        if (count == 0) break;
+        if ((uint64_t)count > maximum - total) {
+            result = KSEC_ERR_LIMIT;
+            goto out;
+        }
+        if (ksec_write_all(fd, chunk.data, (size_t)count) != 0) {
+            result = KSEC_ERR_IO;
+            goto out;
+        }
+        total += (uint64_t)count;
+    }
+    if (lseek(fd, 0, SEEK_SET) != 0
+            || fcntl(fd, F_ADD_SEALS,
+                     F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW
+                         | F_SEAL_WRITE) != 0) {
+        result = KSEC_ERR_IO;
+        goto out;
+    }
+    *out_fd = fd;
+    fd = -1;
+    result = KSEC_OK;
+out:
+    if (fd >= 0) (void)close(fd);
+    ksec_secure_free(&chunk);
+    return result;
+}
+
+static ksec_result copy_reply_fd(int reply_fd, int output_fd, uint64_t maximum) {
+    if (reply_fd < 0) return KSEC_ERR_PROTOCOL;
+    if (maximum > (uint64_t)SIZE_MAX) return KSEC_ERR_LIMIT;
+    if (ksec_copy_fd(reply_fd, output_fd, (size_t)maximum, NULL) != 0) {
+        return KSEC_ERR_IO;
+    }
+    return KSEC_OK;
+}
 
 ksec_result ksec_dataset_create(ksec_client *client, const char *label,
                                 uint8_t record_id[KSEC_RECORD_ID_BYTES]) {
-    (void)client; (void)label; (void)record_id;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    uint8_t payload[2U + KSEC_MAX_LABEL];
+    uint8_t response[KSEC_RECORD_ID_BYTES];
+    size_t label_len;
+    size_t response_len = 0U;
+    ksec_result result;
+    memset(payload, 0, sizeof payload);
+    memset(response, 0, sizeof response);
+    if (record_id != NULL) sodium_memzero(record_id, KSEC_RECORD_ID_BYTES);
+    if (client == NULL || record_id == NULL
+            || ksec_validate_name(label, KSEC_MAX_LABEL) != 0) {
+        return KSEC_ERR_INVALID;
+    }
+    label_len = strlen(label);
+    ksec_put_u16(payload, (uint16_t)label_len);
+    memcpy(payload + 2U, label, label_len);
+    result = simple_request(client, KSEC_OP_DATASET_CREATE, payload,
+                            (uint32_t)(2U + label_len), NULL, response,
+                            sizeof response, &response_len);
+    if (result == KSEC_OK && response_len == KSEC_RECORD_ID_BYTES) {
+        memcpy(record_id, response, KSEC_RECORD_ID_BYTES);
+    } else if (result == KSEC_OK) {
+        result = KSEC_ERR_PROTOCOL;
+    }
+    sodium_memzero(payload, sizeof payload);
+    sodium_memzero(response, sizeof response);
+    return result;
+}
+
+/*
+ * Send an already-sealed request memfd. output_fd is written only after the
+ * daemon has returned KSEC_OK and the response payload has the expected
+ * length. On every other path output_fd is left untouched.
+ */
+static ksec_result exchange_dataset(ksec_client *client, uint16_t operation,
+                                    const uint8_t *payload, uint32_t payload_len,
+                                    int request_fd, int output_fd,
+                                    uint64_t output_limit, uint8_t *response,
+                                    size_t response_size, size_t expect_response) {
+    size_t response_len = 0U;
+    int reply_fd = -1;
+    ksec_result result;
+    result = exchange(client, operation, payload, payload_len, request_fd,
+                      response, response_size, &response_len, &reply_fd);
+    if (result != KSEC_OK) return result;
+    if (reply_fd < 0 || response_len != expect_response) {
+        if (reply_fd >= 0) (void)close(reply_fd);
+        return KSEC_ERR_PROTOCOL;
+    }
+    result = copy_reply_fd(reply_fd, output_fd, output_limit);
+    if (close(reply_fd) != 0 && result == KSEC_OK) result = KSEC_ERR_IO;
+    return result;
 }
 
 ksec_result ksec_seal_fd(ksec_client *client,
                          const uint8_t record_id[KSEC_RECORD_ID_BYTES],
                          const char *dataset_name, uint64_t revision,
                          int input_fd, int output_fd) {
-    (void)client; (void)record_id; (void)dataset_name; (void)revision;
-    (void)input_fd; (void)output_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    uint8_t payload[KSEC_RECORD_ID_BYTES + 8U + 2U + KSEC_MAX_DATASET_NAME];
+    uint8_t response[1];
+    size_t name_len;
+    uint64_t sealed_limit = 0U;
+    int request_fd = -1;
+    ksec_result result;
+    memset(payload, 0, sizeof payload);
+    memset(response, 0, sizeof response);
+    if (client == NULL || record_id == NULL || input_fd < 0 || output_fd < 0
+            || ksec_validate_name(dataset_name, KSEC_MAX_DATASET_NAME) != 0) {
+        return KSEC_ERR_INVALID;
+    }
+    result = read_input_sealed_memfd(input_fd, KSEC_MAX_DATASET_BYTES,
+                                     &request_fd);
+    if (result != KSEC_OK) return result;
+    result = dataset_max_sealed_bytes(&sealed_limit);
+    if (result != KSEC_OK) {
+        (void)close(request_fd);
+        return result;
+    }
+    name_len = strlen(dataset_name);
+    memcpy(payload, record_id, KSEC_RECORD_ID_BYTES);
+    ksec_put_u64(payload + KSEC_RECORD_ID_BYTES, revision);
+    ksec_put_u16(payload + KSEC_RECORD_ID_BYTES + 8U, (uint16_t)name_len);
+    memcpy(payload + KSEC_RECORD_ID_BYTES + 10U, dataset_name, name_len);
+    result = exchange_dataset(
+            client, KSEC_OP_SEAL, payload,
+            (uint32_t)(KSEC_RECORD_ID_BYTES + 10U + name_len),
+            request_fd, output_fd, sealed_limit, response, sizeof response, 0U);
+    (void)close(request_fd);
+    sodium_memzero(payload, sizeof payload);
+    sodium_memzero(response, sizeof response);
+    return result;
 }
 
 ksec_result ksec_unseal_fd(ksec_client *client,
                            const uint8_t record_id[KSEC_RECORD_ID_BYTES],
                            const char *dataset_name, int input_fd,
                            int output_fd, uint64_t *revision) {
-    (void)client; (void)record_id; (void)dataset_name; (void)input_fd;
-    (void)output_fd; (void)revision;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
+    uint8_t payload[KSEC_RECORD_ID_BYTES + 2U + KSEC_MAX_DATASET_NAME];
+    uint8_t response[8];
+    size_t name_len;
+    uint64_t sealed_limit = 0U;
+    int request_fd = -1;
+    ksec_result result;
+    memset(payload, 0, sizeof payload);
+    memset(response, 0, sizeof response);
+    if (revision == NULL) return KSEC_ERR_INVALID;
+    *revision = 0U;
+    if (client == NULL || record_id == NULL || input_fd < 0 || output_fd < 0
+            || ksec_validate_name(dataset_name, KSEC_MAX_DATASET_NAME) != 0) {
+        return KSEC_ERR_INVALID;
+    }
+    result = dataset_max_sealed_bytes(&sealed_limit);
+    if (result != KSEC_OK) return result;
+    result = read_input_sealed_memfd(input_fd, sealed_limit, &request_fd);
+    if (result != KSEC_OK) return result;
+    name_len = strlen(dataset_name);
+    memcpy(payload, record_id, KSEC_RECORD_ID_BYTES);
+    ksec_put_u16(payload + KSEC_RECORD_ID_BYTES, (uint16_t)name_len);
+    memcpy(payload + KSEC_RECORD_ID_BYTES + 2U, dataset_name, name_len);
+    result = exchange_dataset(
+            client, KSEC_OP_UNSEAL, payload,
+            (uint32_t)(KSEC_RECORD_ID_BYTES + 2U + name_len),
+            request_fd, output_fd, KSEC_MAX_DATASET_BYTES, response,
+            sizeof response, sizeof response);
+    (void)close(request_fd);
+    if (result == KSEC_OK) *revision = ksec_get_u64(response);
+    sodium_memzero(payload, sizeof payload);
+    sodium_memzero(response, sizeof response);
+    return result;
 }
 
 /* ---- Status and watch: client side (lane L3). ---- */
