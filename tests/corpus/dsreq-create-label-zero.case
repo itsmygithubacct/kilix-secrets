@@ -1,0 +1,3 @@
+# create label length 0
+kind=dsreq-create
+hex=0000
