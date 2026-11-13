@@ -129,9 +129,11 @@ See `docs/SEALED-DATASETS.md`, `docs/PROTOCOL.md` and `docs/VAULT-FORMAT.md`.
 ## Python binding
 
 `python/kilix_secrets` is a standard-library ctypes binding for Python 3.11
-and newer, installed to `lib/python3/dist-packages` and shipped in the
-package. `Session` runs vault calls in a worker child process that holds the
-capability and is renewed before the capability expires. `Watcher` keeps a
+and newer. A `/usr` install uses `lib/python3/dist-packages`. A `/usr/local`
+install uses `lib/pythonX.Y/dist-packages`, which is where Debian's
+`python3 -I` looks. The binding is shipped in the package. `Session` runs
+vault calls in a worker child process that holds the capability and is
+renewed before the capability expires. `Watcher` keeps a
 `WATCH` open and calls back when the vault locks. `seal_file` and
 `unseal_file` publish atomically. See `docs/PYTHON.md`.
 

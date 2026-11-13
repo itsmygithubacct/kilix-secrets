@@ -6,6 +6,17 @@ DESTDIR ?=
 BUILD ?= build
 TEST_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),/tmp)
 
+# Debian python3 -I searches /usr/lib/python3/dist-packages (a /usr package)
+# and /usr/local/lib/pythonX.Y/dist-packages. It does not search
+# $(PREFIX)/lib/python3/dist-packages, so that layout cannot be imported
+# when PREFIX is /usr/local.
+PYTHON_VERSION := $(shell python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+ifeq ($(PREFIX),/usr)
+PYTHONDIR ?= $(PREFIX)/lib/python3/dist-packages
+else
+PYTHONDIR ?= $(PREFIX)/lib/python$(PYTHON_VERSION)/dist-packages
+endif
+
 SODIUM_CPPFLAGS ?= $(shell $(PKG_CONFIG) --cflags libsodium 2>/dev/null)
 SODIUM_LDLIBS ?= $(shell $(PKG_CONFIG) --libs libsodium 2>/dev/null || printf '%s' '-lsodium')
 SYSTEMD_CPPFLAGS ?= $(shell $(PKG_CONFIG) --cflags libsystemd 2>/dev/null)
@@ -178,7 +189,7 @@ install: all
 		$(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig \
 		$(DESTDIR)$(PREFIX)/lib/systemd/user \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets
 	install -m 0644 include/kilix_secrets.h $(DESTDIR)$(PREFIX)/include/
 	install -m 0644 $(BUILD)/libkilix-secrets.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 0755 $(BUILD)/libkilix-secrets.so.0 $(DESTDIR)$(PREFIX)/lib/
@@ -196,7 +207,7 @@ install: all
 		python/kilix_secrets/_protocol.py \
 		python/kilix_secrets/_session.py \
 		python/kilix_secrets/worker.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/kilix_secrets.h \
@@ -212,15 +223,16 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/THIRD_PARTY_NOTICES.md \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/DEPENDENCIES.md \
 		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/__init__.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_binding.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_files.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_protocol.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/_session.py \
-		$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets/worker.py
-	-rmdir $(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets
-	-rmdir $(DESTDIR)$(PREFIX)/lib/python3/dist-packages
-	-rmdir $(DESTDIR)$(PREFIX)/lib/python3
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/__init__.py \
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_binding.py \
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_files.py \
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_protocol.py \
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_session.py \
+		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/worker.py
+	rm -rf $(DESTDIR)$(PYTHONDIR)/kilix_secrets/__pycache__
+	-rmdir $(DESTDIR)$(PYTHONDIR)/kilix_secrets
+	-rmdir $(DESTDIR)$(PYTHONDIR)
+	-rmdir $(dir $(DESTDIR)$(PYTHONDIR))
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/kilix-secrets
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc
 	-rmdir $(DESTDIR)$(PREFIX)/share

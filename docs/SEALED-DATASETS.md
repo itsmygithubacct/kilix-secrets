@@ -308,7 +308,8 @@ path. It exposes every public C function, typed exceptions per
 
 `seal_file` / `unseal_file` write to a temporary file beside the target,
 fsync, rename and fsync the directory. Installed by `make install` under
-`$(PREFIX)/lib/python3/dist-packages/kilix_secrets`.
+`$(PYTHONDIR)/kilix_secrets` (`lib/python3/dist-packages` when `PREFIX` is
+`/usr`, and `lib/pythonX.Y/dist-packages` otherwise).
 
 ## 8. Line endings
 
@@ -337,9 +338,10 @@ B-3 and B-5). Neither changes the file format, the vectors or operations
    `KSEC_ERR_BUSY` while the requesting connection has an unread reply
    (`ioctl(SIOCOUTQ)` greater than zero), checked right after the descriptor is
    found present. Unread dataset replies are therefore bounded at one per
-   connection, 64 in total. Replies the client has read and kept are the
-   client's descriptors, bounded only by its descriptor limit, and stay charged
-   to the daemon's memory cgroup until closed (review round 2, B2-1).
+   connection, 64 in total. Replies the client has read are the client's to
+   keep. The daemon does not bound them: they stay charged to the daemon's
+   memory cgroup until every descriptor and mapping is gone, limited only by
+   memory and by how many descriptors the user's processes can hold.
 2. **Partial output (B-5).** The client cannot take back bytes already written
    to a pipe or a full disk, so a write failure after `KSEC_OK` may leave a
    prefix in `output_fd`. The call still returns `KSEC_ERR_IO`.

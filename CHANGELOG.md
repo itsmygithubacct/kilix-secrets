@@ -28,6 +28,12 @@
 - Add the standard-library Python binding `kilix_secrets` with a `Session`
   worker process and a `Watcher` (`docs/PYTHON.md`), installed and packaged
   with the library. `VERSION` is 0.2.0-dev; the soname is unchanged.
+  `PREFIX=/usr` installs it to `lib/python3/dist-packages`. Any other
+  prefix, including `/usr/local`, installs it to `lib/pythonX.Y/dist-packages`,
+  which is the directory Debian's `python3 -I` searches.
+- State the bound on replies the client has already read: the daemon does
+  not bound them. They stay charged to its memory cgroup until every
+  descriptor and mapping is gone.
 - Extend the parser harness, negative corpus and limits tests to the new
   operations and the sealed file format.
 - Establish the local-only F112 implementation candidate after accepted A112.

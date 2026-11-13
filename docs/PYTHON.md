@@ -76,8 +76,11 @@ writer cannot replace the target or leave a plaintext temporary.
 
 ## Install
 
-`make install` copies the package to
-`$(DESTDIR)$(PREFIX)/lib/python3/dist-packages/kilix_secrets`.
+`make install` copies the package to `$(DESTDIR)$(PYTHONDIR)/kilix_secrets`.
+`PREFIX=/usr` uses `lib/python3/dist-packages`, which Debian's `python3 -I`
+searches. Any other prefix, including `/usr/local`, uses
+`lib/pythonX.Y/dist-packages`. `$(PREFIX)/lib/python3/dist-packages` is not
+on that path, so a `/usr/local` install there cannot be imported.
 
 ## Tests
 
