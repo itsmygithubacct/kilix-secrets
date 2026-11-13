@@ -6,11 +6,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -484,6 +487,318 @@ static int parse_revision(const char *text, uint64_t *out) {
     return 0;
 }
 
+/* Requests sent with the replies left unread. Matches the B-3 probe. */
+#define PIPELINE_FLOOD_COUNT 4000U
+
+static int activate_raw(int sock, int capability_fd, ksec_result *out) {
+    ksec_packet_header request;
+    ksec_packet_header reply;
+    uint8_t reply_body[64];
+    int received = -1;
+    ksec_result result;
+    uint32_t code;
+    memset(&request, 0, sizeof request);
+    memset(&reply, 0, sizeof reply);
+    memset(reply_body, 0, sizeof reply_body);
+    request.version = KSEC_PROTOCOL_VERSION;
+    request.operation = (uint16_t)KSEC_OP_ACTIVATE;
+    request.request_id = fresh_request_id();
+    result = ksec_send_packet(sock, &request, NULL, capability_fd);
+    (void)close(capability_fd);
+    if (result != KSEC_OK) {
+        *out = result;
+        return -1;
+    }
+    result = ksec_recv_packet(sock, &reply, reply_body, sizeof reply_body,
+                              &received);
+    if (received >= 0) (void)close(received);
+    if (result != KSEC_OK) {
+        *out = result;
+        return -1;
+    }
+    if (reply.operation != (uint16_t)KSEC_OP_ACTIVATE
+            || reply.request_id != request.request_id
+            || reply.payload_len != 4U) {
+        *out = KSEC_ERR_PROTOCOL;
+        return -1;
+    }
+    code = ksec_get_u32(reply_body);
+    if (code > (uint32_t)KSEC_ERR_CONFLICT) {
+        *out = KSEC_ERR_PROTOCOL;
+        return -1;
+    }
+    *out = (ksec_result)code;
+    sodium_memzero(reply_body, sizeof reply_body);
+    return *out == KSEC_OK ? 0 : -1;
+}
+
+static int sealed_memfd_from_file(const char *path) {
+    size_t copied = 0U;
+    int input;
+    int output;
+    input = open(path, O_RDONLY | O_CLOEXEC);
+    if (input < 0) return -1;
+    output = memfd_create("ksec-dataset-pipe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (output < 0) {
+        (void)close(input);
+        return -1;
+    }
+    if (ksec_copy_fd(input, output, 1024U * 1024U, &copied) != 0
+            || copied == 0U
+            || lseek(output, 0, SEEK_SET) != 0
+            || fcntl(output, F_ADD_SEALS,
+                     F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+        (void)close(input);
+        (void)close(output);
+        return -1;
+    }
+    (void)close(input);
+    return output;
+}
+
+static size_t write_dataset_body(uint8_t *body,
+                                 const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                                 int sealing, uint64_t revision, const char *name) {
+    size_t name_len = strlen(name);
+    memcpy(body, record_id, KSEC_RECORD_ID_BYTES);
+    if (sealing) {
+        ksec_put_u64(body + KSEC_RECORD_ID_BYTES, revision);
+        ksec_put_u16(body + KSEC_RECORD_ID_BYTES + 8U, (uint16_t)name_len);
+        memcpy(body + KSEC_RECORD_ID_BYTES + 10U, name, name_len);
+        return KSEC_RECORD_ID_BYTES + 10U + name_len;
+    }
+    ksec_put_u16(body + KSEC_RECORD_ID_BYTES, (uint16_t)name_len);
+    memcpy(body + KSEC_RECORD_ID_BYTES + 2U, name, name_len);
+    return KSEC_RECORD_ID_BYTES + 2U + name_len;
+}
+
+static const char *reply_word(ksec_result result) {
+    if (result == KSEC_OK) return "OK";
+    if (result == KSEC_ERR_BUSY) return "BUSY";
+    return NULL;
+}
+
+/* Reads one reply. Closes a received descriptor. Returns 0, or -1 at EOF. */
+static int read_dataset_reply(int sock, uint16_t operation, uint64_t request_id,
+                              ksec_result *result_out, int *has_fd) {
+    ksec_packet_header reply;
+    uint8_t reply_body[64];
+    int received = -1;
+    ksec_result result;
+    uint32_t code;
+    memset(&reply, 0, sizeof reply);
+    memset(reply_body, 0, sizeof reply_body);
+    *has_fd = 0;
+    result = ksec_recv_packet(sock, &reply, reply_body, sizeof reply_body,
+                              &received);
+    if (received >= 0) {
+        *has_fd = 1;
+        (void)close(received);
+    }
+    if (result != KSEC_OK) return -1;
+    if (reply.operation != operation || reply.request_id != request_id
+            || reply.payload_len < 4U || reply.payload_len > sizeof reply_body) {
+        return -1;
+    }
+    code = ksec_get_u32(reply_body);
+    sodium_memzero(reply_body, sizeof reply_body);
+    if (code > (uint32_t)KSEC_ERR_CONFLICT) return -1;
+    *result_out = (ksec_result)code;
+    return 0;
+}
+
+static int send_dataset_op(int sock, uint16_t operation,
+                           const uint8_t *body, size_t body_len, int passed,
+                           uint64_t *request_id_out) {
+    ksec_packet_header request;
+    memset(&request, 0, sizeof request);
+    request.version = KSEC_PROTOCOL_VERSION;
+    request.operation = operation;
+    request.request_id = fresh_request_id();
+    request.payload_len = (uint32_t)body_len;
+    *request_id_out = request.request_id;
+    return ksec_send_packet(sock, &request, body, passed) == KSEC_OK ? 0 : -1;
+}
+
+/*
+ * The first reply can arrive before this process reads it. Stay out of
+ * recv after that, long enough for the daemon to handle the request that
+ * was already sent. Reading immediately races the daemon and hides the
+ * unread reply.
+ */
+static int pause_after_first_reply(int sock) {
+    struct pollfd wait_fd;
+    struct timespec delay;
+    int ready;
+    wait_fd.fd = sock;
+    wait_fd.events = POLLIN;
+    do {
+        wait_fd.revents = 0;
+        ready = poll(&wait_fd, 1, 10000);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0) return -1;
+    delay.tv_sec = 1;
+    delay.tv_nsec = 0;
+    while (nanosleep(&delay, &delay) != 0) {
+        if (errno != EINTR) return -1;
+    }
+    return 0;
+}
+
+/* Do not read while the daemon is still answering. It closes on a full queue. */
+static int wait_for_hangup(int sock) {
+    struct pollfd wait_fd;
+    int left = 10000;
+    wait_fd.fd = sock;
+    wait_fd.events = POLLHUP;
+    while (left > 0) {
+        int slice = left > 200 ? 200 : left;
+        int ready;
+        wait_fd.revents = 0;
+        ready = poll(&wait_fd, 1, slice);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return -1;
+        if ((wait_fd.revents & (POLLHUP | POLLERR)) != 0) return 0;
+        left -= slice;
+    }
+    return 0;
+}
+
+static int print_tagged(const char *label, ksec_result result, int has_fd) {
+    const char *word = reply_word(result);
+    if (word != NULL) {
+        printf("%s %s %s\n", label, word, has_fd ? "FD" : "NOFD");
+    } else {
+        printf("%s ERROR %s %s\n", label, ksec_result_string(result),
+               has_fd ? "FD" : "NOFD");
+    }
+    return fflush(stdout) == 0 ? 0 : -1;
+}
+
+/*
+ * Two requests with neither reply read, then one more after both replies
+ * have been read. The second must be busy and carry no descriptor. The
+ * third must succeed: the connection no longer has an unread reply.
+ */
+static int run_pipeline(const char *socket_path,
+                        const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                        const char *name, int sealing, const char *path,
+                        int capability_fd) {
+    uint8_t body[KSEC_RECORD_ID_BYTES + 10U + KSEC_MAX_DATASET_NAME];
+    uint64_t ids[3];
+    size_t body_len;
+    int sock = -1;
+    int passed = -1;
+    int has_fd = 0;
+    ksec_result result = KSEC_ERR_IO;
+    uint16_t operation = (uint16_t)(sealing ? KSEC_OP_SEAL : KSEC_OP_UNSEAL);
+    memset(body, 0, sizeof body);
+    memset(ids, 0, sizeof ids);
+    passed = sealing ? make_memfd(NULL, 0U, 0, 1) : sealed_memfd_from_file(path);
+    if (passed < 0) {
+        (void)close(capability_fd);
+        return print_result(KSEC_ERR_IO);
+    }
+    sock = connect_unix(socket_path);
+    if (sock < 0 || activate_raw(sock, capability_fd, &result) != 0) {
+        if (sock < 0) (void)close(capability_fd);
+        if (sock >= 0) (void)close(sock);
+        (void)close(passed);
+        return print_result(result);
+    }
+    capability_fd = -1;
+    body_len = write_dataset_body(body, record_id, sealing, 7U, name);
+    if (send_dataset_op(sock, operation, body, body_len, passed, &ids[0]) != 0
+            || send_dataset_op(sock, operation, body, body_len, passed, &ids[1]) != 0
+            || pause_after_first_reply(sock) != 0
+            || read_dataset_reply(sock, operation, ids[0], &result, &has_fd) != 0
+            || print_tagged("FIRST", result, has_fd) != 0
+            || read_dataset_reply(sock, operation, ids[1], &result, &has_fd) != 0
+            || print_tagged("SECOND", result, has_fd) != 0
+            || send_dataset_op(sock, operation, body, body_len, passed, &ids[2]) != 0
+            || read_dataset_reply(sock, operation, ids[2], &result, &has_fd) != 0
+            || print_tagged("NEXT", result, has_fd) != 0) {
+        (void)close(sock);
+        (void)close(passed);
+        sodium_memzero(body, sizeof body);
+        return 1;
+    }
+    (void)close(sock);
+    (void)close(passed);
+    sodium_memzero(body, sizeof body);
+    return 0;
+}
+
+/*
+ * Send PIPELINE_FLOOD_COUNT zero-byte seals without reading any reply, the
+ * same shape as the B-3 reproducer at --size-mib 0 --count 4000. Reading
+ * starts only after the send loop stops, so a reply stays queued while the
+ * later requests are handled.
+ */
+static int run_flood(const char *socket_path,
+                     const uint8_t record_id[KSEC_RECORD_ID_BYTES],
+                     const char *name, int capability_fd) {
+    uint8_t body[KSEC_RECORD_ID_BYTES + 10U + KSEC_MAX_DATASET_NAME];
+    uint64_t request_ids[PIPELINE_FLOOD_COUNT];
+    size_t body_len;
+    size_t sent = 0U;
+    size_t ok_count = 0U;
+    size_t busy_count = 0U;
+    size_t descriptors = 0U;
+    size_t index;
+    int sock = -1;
+    int passed = -1;
+    ksec_result result = KSEC_ERR_IO;
+    memset(body, 0, sizeof body);
+    memset(request_ids, 0, sizeof request_ids);
+    passed = make_memfd(NULL, 0U, 0, 1);
+    if (passed < 0) {
+        (void)close(capability_fd);
+        return print_result(KSEC_ERR_IO);
+    }
+    sock = connect_unix(socket_path);
+    if (sock < 0 || activate_raw(sock, capability_fd, &result) != 0) {
+        if (sock < 0) (void)close(capability_fd);
+        if (sock >= 0) (void)close(sock);
+        (void)close(passed);
+        return print_result(result);
+    }
+    capability_fd = -1;
+    body_len = write_dataset_body(body, record_id, 1, 0U, name);
+    for (index = 0; index < PIPELINE_FLOOD_COUNT; index++) {
+        if (send_dataset_op(sock, (uint16_t)KSEC_OP_SEAL, body, body_len, passed,
+                            &request_ids[index]) != 0) {
+            break;
+        }
+        sent++;
+    }
+    /*
+     * Replies stay unread until the daemon stops sending. With the default
+     * socket buffer it closes; the wait also covers a buffer that holds
+     * every busy reply.
+     */
+    if (wait_for_hangup(sock) != 0) {
+        (void)close(sock);
+        (void)close(passed);
+        sodium_memzero(body, sizeof body);
+        return 1;
+    }
+    for (index = 0; index < sent; index++) {
+        int has_fd = 0;
+        if (read_dataset_reply(sock, (uint16_t)KSEC_OP_SEAL, request_ids[index],
+                               &result, &has_fd) != 0) break;
+        if (has_fd) descriptors++;
+        if (result == KSEC_OK) ok_count++;
+        else if (result == KSEC_ERR_BUSY) busy_count++;
+    }
+    printf("SENT %zu\nOK %zu\nBUSY %zu\nDESCRIPTORS %zu\n",
+           sent, ok_count, busy_count, descriptors);
+    (void)close(sock);
+    (void)close(passed);
+    sodium_memzero(body, sizeof body);
+    return fflush(stdout) == 0 ? 0 : 1;
+}
+
 static int launch(char **argv, const char *socket_path, const char *app_id,
                   uint32_t verbs, const uint8_t *scope) {
     int control[2] = {-1, -1};
@@ -551,6 +866,24 @@ static int launch(char **argv, const char *socket_path, const char *app_id,
             }
             result = run_raw(socket_path, record_id, argv[6], revision, sealing,
                              argv[8], path, capability_fd);
+            sodium_memzero(record_id, sizeof record_id);
+        } else if (strcmp(argv[1], "pipeline") == 0) {
+            uint8_t record_id[KSEC_RECORD_ID_BYTES];
+            int sealing = strcmp(argv[4], "seal") == 0;
+            if (ksec_hex_decode(argv[5], record_id, sizeof record_id) != 0) {
+                (void)close(capability_fd);
+                _exit(2);
+            }
+            result = run_pipeline(socket_path, record_id, argv[6], sealing,
+                                  sealing ? NULL : argv[7], capability_fd);
+            sodium_memzero(record_id, sizeof record_id);
+        } else if (strcmp(argv[1], "flood") == 0) {
+            uint8_t record_id[KSEC_RECORD_ID_BYTES];
+            if (ksec_hex_decode(argv[4], record_id, sizeof record_id) != 0) {
+                (void)close(capability_fd);
+                _exit(2);
+            }
+            result = run_flood(socket_path, record_id, argv[5], capability_fd);
             sodium_memzero(record_id, sizeof record_id);
         } else {
             (void)close(capability_fd);
@@ -657,6 +990,28 @@ int main(int argc, char **argv) {
                     && strcmp(argv[8], "missing") != 0
                     && strcmp(argv[8], "oversize") != 0
                     && strcmp(argv[8], "unsealed-big") != 0)) {
+            return 2;
+        }
+        verbs = KSEC_VERB_USE;
+    } else if (strcmp(argv[1], "pipeline") == 0) {
+        int sealing;
+        if (argc < 7 || ksec_validate_app_id(argv[3]) != 0
+                || (strcmp(argv[4], "seal") != 0 && strcmp(argv[4], "unseal") != 0)
+                || ksec_hex_decode(argv[5], scope, sizeof scope) != 0
+                || ksec_validate_name(argv[6], KSEC_MAX_DATASET_NAME) != 0) {
+            return 2;
+        }
+        sealing = strcmp(argv[4], "seal") == 0;
+        if (sealing) {
+            if (argc != 7) return 2;
+        } else if (argc != 8) {
+            return 2;
+        }
+        verbs = KSEC_VERB_USE;
+    } else if (strcmp(argv[1], "flood") == 0) {
+        if (argc != 6 || ksec_validate_app_id(argv[3]) != 0
+                || ksec_hex_decode(argv[4], scope, sizeof scope) != 0
+                || ksec_validate_name(argv[5], KSEC_MAX_DATASET_NAME) != 0) {
             return 2;
         }
         verbs = KSEC_VERB_USE;

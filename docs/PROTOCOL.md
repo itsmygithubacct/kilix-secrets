@@ -138,15 +138,19 @@ plaintext with a 64-byte owner and a 128-byte name; anything larger exceeds
 the limit. A length that is not the exact sealed length is invalid input.
 
 Checks for both operations then run in this order: payload grammar, descriptor
-present, vault unlocked, record present and not deleted, `use` authorized on
-that record, and the record is a valid dataset key. A missing or deleted
-record is not found. A failed `use` check is denied. Anything that is not a
-dataset key is invalid input. Only after those checks come the descriptor
-seals and size, the `seal` or `unseal` audit outcome `begin`, the crypto, and
-the audit outcome `ok`. The audit line carries the record ID. It does not
-carry key bytes, plaintext, or the dataset name. Neither operation changes
-the store or any filesystem path. If the `ok` audit cannot be written, the
-reply descriptor is discarded.
+present, no unread reply on this connection, vault unlocked, record present
+and not deleted, `use` authorized on that record, and the record is a valid
+dataset key. An unread reply is `ioctl(SIOCOUTQ)` greater than zero on the
+daemon's socket. The daemon answers `busy` and writes no audit line for that
+refusal. An ioctl failure is an I/O failure. One connection therefore holds
+at most one unread `SEAL` or `UNSEAL` reply. A missing or deleted record is
+not found. A failed `use` check is denied. Anything that is not a dataset key
+is invalid input. Only after those checks come the descriptor seals and size,
+the `seal` or `unseal` audit outcome `begin`, the crypto, and the audit
+outcome `ok`. The audit line carries the record ID. It does not carry key
+bytes, plaintext, or the dataset name. Neither operation changes the store or
+any filesystem path. If the `ok` audit cannot be written, the reply descriptor
+is discarded.
 
 A successful `SEAL` reply has an empty payload and one daemon-made memfd of
 the sealed file. A successful `UNSEAL` reply has a big-endian u64 revision

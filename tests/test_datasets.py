@@ -411,6 +411,34 @@ def main() -> int:
                 f"prefix={prefix!r} unseal={unseal_line!r} "
                 f"opened_size={opened.stat().st_size if opened.exists() else -1}")
 
+        piped_seal = helper_run(
+            ["pipeline", str(socket_path), APP, "seal", record_id, NAME])
+        piped_unseal = helper_run(
+            ["pipeline", str(socket_path), APP, "unseal", record_id, NAME,
+             str(sealed_1)])
+        expected_pipe = [b"FIRST OK FD", b"SECOND BUSY NOFD", b"NEXT OK FD"]
+        checks.check(piped_seal.returncode == 0
+                     and piped_seal.stdout.splitlines() == expected_pipe,
+                     "two unread seals: first ok with a descriptor, second "
+                     f"busy with none, then ok again: {piped_seal.stdout!r} "
+                     f"stderr={piped_seal.stderr!r}")
+        checks.check(piped_unseal.returncode == 0
+                     and piped_unseal.stdout.splitlines() == expected_pipe,
+                     "two unread unseals: first ok with a descriptor, second "
+                     f"busy with none, then ok again: {piped_unseal.stdout!r} "
+                     f"stderr={piped_unseal.stderr!r}")
+        flood = helper_run(
+            ["flood", str(socket_path), APP, record_id, NAME], timeout=120)
+        flood_lines = flood.stdout.splitlines()
+        checks.check(flood.returncode == 0
+                     and b"OK 1" in flood_lines
+                     and b"DESCRIPTORS 1" in flood_lines
+                     and b"BUSY 0" not in flood_lines
+                     and any(line.startswith(b"BUSY ") for line in flood_lines),
+                     "four thousand pipelined empty seals keep at most one "
+                     f"reply descriptor: {flood.stdout!r} "
+                     f"stderr={flood.stderr!r}")
+
         too_big = root / "plain-too-big"
         sparse_file(too_big, 64 * 1024 * 1024 + 1)
         expect_error(
