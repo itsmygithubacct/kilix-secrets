@@ -48,8 +48,9 @@ The administrative CLI includes `init`, `unlock`, `lock`, `passwd`, `add`,
 `import`, `compact`, and `doctor`. Destructive record deletion requires the
 exact form `delete RECORD --confirm RECORD`. `get` writes a field only to a
 new 0600 file (`--output FILE`) or a descriptor (`--output-fd N`), never to a
-terminal. `replace RECORD --field NAME` replaces the record's fields with that
-one field and keeps its type, label, expiry and grants. `add` and `replace`
+terminal. `replace RECORD --field NAME` replaces the value of a single-field
+record, keeping its type, label, expiry and grants; it refuses a record with
+more than one field. `add` and `replace`
 strip trailing CR and LF bytes from the value unless given `--raw`.
 Backup output is encrypted-only, is created as a new 0600 file, and is never
 silently overwritten. Import verifies the complete artifact, retains the
