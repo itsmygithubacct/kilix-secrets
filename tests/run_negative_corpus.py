@@ -22,7 +22,9 @@ def read_case(path: Path) -> tuple[str, bytes]:
         values[key] = value
     if set(values) != {"kind", "hex"}:
         raise ValueError(f"invalid case fields: {path.name}")
-    if values["kind"] not in {"protocol", "header", "record", "ad", "backup"}:
+    if values["kind"] not in {
+            "protocol", "header", "record", "ad", "backup",
+            "dataset", "dsreq-create", "dsreq-seal", "dsreq-unseal"}:
         raise ValueError(f"invalid parser kind: {path.name}")
     return values["kind"], bytes.fromhex(values["hex"])
 
