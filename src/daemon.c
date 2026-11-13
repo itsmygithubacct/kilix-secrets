@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -19,6 +20,11 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* Linux uapi names this TIOCOUTQ. The contract calls it SIOCOUTQ. */
+#ifndef SIOCOUTQ
+#define SIOCOUTQ TIOCOUTQ
+#endif
 
 typedef struct {
     int fd;
@@ -1921,9 +1927,22 @@ out:
 }
 
 /*
+ * True when this connection still has a reply the client has not read.
+ * Measured on the accepted socket: one queued message makes SIOCOUTQ > 0,
+ * and the value returns to 0 once that message is received.
+ */
+static ksec_result connection_reply_pending(int fd) {
+    int queued = 0;
+    if (ioctl(fd, SIOCOUTQ, &queued) != 0) return KSEC_ERR_IO;
+    if (queued > 0) return KSEC_ERR_BUSY;
+    return KSEC_OK;
+}
+
+/*
  * Shared SEAL/UNSEAL prefix. Order is the contract's: payload grammar,
- * descriptor present, unlocked, record, use, dataset-key schema. Seals and
- * size are checked by the caller after this returns, still before audit.
+ * descriptor present, no unread reply, unlocked, record, use, dataset-key
+ * schema. Seals and size are checked by the caller after this returns,
+ * still before audit. The unread-reply refusal is not audited.
  */
 static ksec_result begin_dataset_use(
         daemon_state *state, daemon_connection *connection,
@@ -1947,6 +1966,8 @@ static ksec_result begin_dataset_use(
     }
     if (result != KSEC_OK) return result;
     if (received_fd < 0) return KSEC_ERR_PROTOCOL;
+    result = connection_reply_pending(connection->fd);
+    if (result != KSEC_OK) return result;
     if (!state->unlocked) return KSEC_ERR_LOCKED;
     record = ksec_store_find(&state->store, record_id);
     if (record == NULL || record->deleted) return KSEC_ERR_NOT_FOUND;
