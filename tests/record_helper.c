@@ -1,4 +1,5 @@
-/* Puts, replaces and reads records whose field values are taken byte-exact from a file. */
+/* Puts, replaces and reads records whose field values are taken byte-exact from a file.
+ * `put2` puts the same record with a second field named "extra". */
 #define _GNU_SOURCE
 
 #include "internal.h"
@@ -132,9 +133,9 @@ static void fill_record(ksec_record *record, ksec_field *field,
 }
 
 static int run_put(const char *socket_path, const char *value_path,
-                   int capability_fd) {
+                   int capability_fd, int two_fields) {
     ksec_secure_buffer value = {0};
-    ksec_field field;
+    ksec_field fields[2];
     ksec_record record;
     ksec_client *client = NULL;
     uint8_t record_id[KSEC_RECORD_ID_BYTES];
@@ -149,7 +150,13 @@ static int run_put(const char *socket_path, const char *value_path,
         report_error(result);
         goto out;
     }
-    fill_record(&record, &field, &value);
+    fill_record(&record, &fields[0], &value);
+    if (two_fields) {
+        /* A second field the CLI cannot create; `replace` must refuse it. */
+        fields[1] = fields[0];
+        fields[1].name = "extra";
+        record.field_count = 2U;
+    }
     result = ksec_put(client, &record, record_id);
     if (result != KSEC_OK) {
         report_error(result);
@@ -229,7 +236,10 @@ static int child_main(const char *command, const char *socket_path,
                       const uint8_t record_id[KSEC_RECORD_ID_BYTES],
                       const char *path, int capability_fd) {
     if (strcmp(command, "put") == 0) {
-        return run_put(socket_path, path, capability_fd);
+        return run_put(socket_path, path, capability_fd, 0);
+    }
+    if (strcmp(command, "put2") == 0) {
+        return run_put(socket_path, path, capability_fd, 1);
     }
     if (strcmp(command, "replace") == 0) {
         return run_replace(socket_path, record_id, path, capability_fd);
@@ -252,7 +262,8 @@ int main(int argc, char **argv) {
             || signal(SIGPIPE, SIG_IGN) == SIG_ERR) return 2;
     command = argv[1];
     socket_path = argv[2];
-    if (strcmp(command, "put") == 0 && argc == 4) {
+    if ((strcmp(command, "put") == 0 || strcmp(command, "put2") == 0)
+            && argc == 4) {
         path = argv[3];
         verbs = KSEC_VERB_CREATE;
     } else if (strcmp(command, "replace") == 0 && argc == 5
