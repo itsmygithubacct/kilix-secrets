@@ -30,11 +30,16 @@ from kilix_secrets._binding import (
     Invalid,
     IoError,
     KilixSecretsError,
+    MAX_DATASET_BYTES,
+    MAX_SEALED_DATASET_BYTES,
     ProtocolError,
     Record,
     Status,
     Verb,
     mint_for_child,
+    read_input_sealed_memfd,
+    require_revision,
+    require_text,
     secret_memfd,
     zero,
 )
@@ -59,6 +64,19 @@ def _package_parent() -> str:
     return str(Path(__file__).resolve().parents[1])
 
 
+def _attempt_fds(source: int, output_fd: int) -> list[int]:
+    """Duplicate ``source`` from offset 0, plus ``output_fd``."""
+    copied = -1
+    try:
+        os.lseek(source, 0, os.SEEK_SET)
+        copied = os.dup(source)
+        return [copied, os.dup(output_fd)]
+    except OSError as exc:
+        if copied >= 0:
+            os.close(copied)
+        raise IoError(os.strerror(exc.errno) if exc.errno else "I/O failure") from exc
+
+
 def _hold_seconds(lifetime: int) -> float:
     """How long to use a capability before replacing it.
 
@@ -77,6 +95,10 @@ class Worker:
         self.sock: socket.socket | None = None
         self.minted_at = 0.0
         self._next_id = 1
+        self._spawn_thread: threading.Thread | None = None
+        self._spawn_ready = threading.Event()
+        self._spawn_release = threading.Event()
+        self._spawn_error: BaseException | None = None
 
     @property
     def pid(self) -> int | None:
@@ -105,24 +127,48 @@ class Worker:
         parent_dir = _package_parent()
         previous = env.get("PYTHONPATH")
         env["PYTHONPATH"] = parent_dir if not previous else parent_dir + os.pathsep + previous
+
+        def spawn() -> None:
+            # PR_SET_PDEATHSIG fires when this thread exits, not when the caller does.
+            try:
+                self.proc = subprocess.Popen(
+                    _WORKER_ARGV,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    pass_fds=(child_fd,),
+                    env=env,
+                )
+            except BaseException as exc:
+                self._spawn_error = exc
+            finally:
+                self._spawn_ready.set()
+            if self._spawn_error is None:
+                self._spawn_release.wait()
+
+        self._spawn_thread = threading.Thread(
+            target=spawn, name="kilix-secrets-spawn", daemon=True)
         try:
-            self.proc = subprocess.Popen(
-                _WORKER_ARGV,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                pass_fds=(child_fd,),
-                env=env,
-            )
+            self._spawn_thread.start()
         except Exception:
             os.close(child_fd)
             parent.close()
+            self._spawn_thread = None
             raise
+        self._spawn_ready.wait()
         os.close(child_fd)
+        if self._spawn_error is not None:
+            parent.close()
+            self._release_spawner()
+            raise self._spawn_error
         self.sock = parent
         self.sock.settimeout(180)
-        cap = mint_for_child(socket_path, self.proc.pid, app_id, verbs, lifetime, record_id)
+        proc = self.proc
+        if proc is None or proc.pid is None:
+            self.close()
+            raise IoError("worker did not start")
+        cap = mint_for_child(socket_path, proc.pid, app_id, verbs, lifetime, record_id)
         self.minted_at = time.monotonic()
         try:
             self._send({"id": 0, "method": "hello", "socket": socket_path}, [cap])
@@ -179,6 +225,8 @@ class Worker:
                 sock.close()
             except OSError:
                 pass
+        # Reap the child before the spawning thread exits. That thread's
+        # death delivers PDEATHSIG.
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -191,9 +239,20 @@ class Worker:
                     proc.kill()
                 except OSError:
                     pass
-                proc.wait(timeout=2)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         if proc is not None and proc.stderr is not None:
             proc.stderr.close()
+        self._release_spawner()
+
+    def _release_spawner(self) -> None:
+        self._spawn_release.set()
+        thread = self._spawn_thread
+        self._spawn_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
 
     def _send(self, payload: dict, fds: list[int]) -> None:
         if self.sock is None:
@@ -229,8 +288,8 @@ class Session:
         if record_id is not None and (
                 not isinstance(record_id, (bytes, bytearray)) or len(record_id) != RECORD_ID_BYTES):
             raise Invalid("record id must be 16 bytes")
-        self._socket_path = socket_path
-        self._app_id = app_id
+        self._socket_path = require_text(socket_path, "socket path")
+        self._app_id = require_text(app_id, "application id")
         self._verbs = int(verbs)
         self._lifetime = lifetime
         self._record_id = None if record_id is None else bytes(record_id)
@@ -370,6 +429,8 @@ class Session:
         self._call("rotate_master", {}, self._secret_fds(passphrase, recovery), restart=True)
 
     def export_backup(self, passphrase: bytes | bytearray, output_path: str) -> None:
+        output_path = require_text(output_path, "output path")
+
         def factory() -> list[int]:
             out = os.open(output_path, os.O_RDWR | os.O_CLOEXEC)
             try:
@@ -380,6 +441,8 @@ class Session:
         self._call("export_backup", {}, factory)
 
     def import_backup(self, passphrase: bytes | bytearray, input_path: str) -> None:
+        input_path = require_text(input_path, "input path")
+
         def factory() -> list[int]:
             inp = os.open(input_path, os.O_RDONLY | os.O_CLOEXEC)
             try:
@@ -391,23 +454,30 @@ class Session:
 
     def reset_vault(self, confirmation: str, passphrase: bytes | bytearray) -> bytearray:
         return self._secret_body(
-            "recovery", "reset_vault", {"confirmation": confirmation},
+            "recovery", "reset_vault",
+            {"confirmation": require_text(confirmation, "confirmation")},
             self._secret_fds(passphrase), restart=True)
 
     def _record_fields(self, record: Record) -> dict:
         if record.fields is None or record.grants is None:
             raise Invalid("record fields are missing")
         return {
-            "owner": record.owner,
-            "type": record.type,
-            "label": record.label,
+            "owner": require_text(record.owner, "owner"),
+            "type": require_text(record.type, "type"),
+            "label": require_text(record.label, "label"),
             "expires_at": int(record.expires_at),
             "fields": [
-                {"name": field.name, "value": _bytes_field(field.value, "field")}
+                {
+                    "name": require_text(field.name, "field name"),
+                    "value": _bytes_field(field.value, "field"),
+                }
                 for field in record.fields
             ],
             "grants": [
-                {"application_id": grant.application_id, "verbs": int(grant.verbs)}
+                {
+                    "application_id": require_text(grant.application_id, "application id"),
+                    "verbs": int(grant.verbs),
+                }
                 for grant in record.grants
             ],
         }
@@ -431,7 +501,7 @@ class Session:
     def get(self, record_id: bytes, field: str, max_len: int | None = None) -> bytearray:
         fields: dict = {
             "record_id": _bytes_field(record_id, "record id"),
-            "field": field,
+            "field": require_text(field, "field name"),
         }
         if max_len is not None:
             fields["max_len"] = int(max_len)
@@ -470,14 +540,14 @@ class Session:
     def grant(self, record_id: bytes, application_id: str, verbs: int) -> None:
         self._call("grant", {
             "record_id": _bytes_field(record_id, "record id"),
-            "application_id": application_id,
+            "application_id": require_text(application_id, "application id"),
             "verbs": int(verbs),
         })
 
     def revoke(self, record_id: bytes, application_id: str) -> None:
         self._call("revoke", {
             "record_id": _bytes_field(record_id, "record id"),
-            "application_id": application_id,
+            "application_id": require_text(application_id, "application id"),
         })
 
     def doctor(self) -> bytes:
@@ -487,7 +557,7 @@ class Session:
         self._call("compact")
 
     def dataset_create(self, label: str) -> bytes:
-        reply, fds = self._call("dataset_create", {"label": label})
+        reply, fds = self._call("dataset_create", {"label": require_text(label, "label")})
         close_fds(fds)
         raw = b64decode(reply["record_id"])
         try:
@@ -497,42 +567,54 @@ class Session:
 
     def seal_fd(self, record_id: bytes, dataset_name: str, revision: int,
                 input_fd: int, output_fd: int) -> None:
-        def factory() -> list[int]:
-            return [os.dup(input_fd), os.dup(output_fd)]
-        self._call("seal_fd", {
-            "record_id": _bytes_field(record_id, "record id"),
-            "name": dataset_name,
-            "revision": int(revision),
-        }, factory)
+        name = require_text(dataset_name, "dataset name")
+        rev = require_revision(revision)
+        snapshot = read_input_sealed_memfd(int(input_fd), MAX_DATASET_BYTES)
+        try:
+            def factory() -> list[int]:
+                return _attempt_fds(snapshot, output_fd)
+            _reply, fds = self._call("seal_fd", {
+                "record_id": _bytes_field(record_id, "record id"),
+                "name": name,
+                "revision": rev,
+            }, factory)
+            close_fds(fds)
+        finally:
+            os.close(snapshot)
 
     def unseal_fd(self, record_id: bytes, dataset_name: str,
                   input_fd: int, output_fd: int) -> int:
-        def factory() -> list[int]:
-            return [os.dup(input_fd), os.dup(output_fd)]
-        reply, fds = self._call("unseal_fd", {
-            "record_id": _bytes_field(record_id, "record id"),
-            "name": dataset_name,
-        }, factory)
-        close_fds(fds)
-        return int(reply["revision"])
+        name = require_text(dataset_name, "dataset name")
+        snapshot = read_input_sealed_memfd(int(input_fd), MAX_SEALED_DATASET_BYTES)
+        try:
+            def factory() -> list[int]:
+                return _attempt_fds(snapshot, output_fd)
+            reply, fds = self._call("unseal_fd", {
+                "record_id": _bytes_field(record_id, "record id"),
+                "name": name,
+            }, factory)
+            close_fds(fds)
+            return int(reply["revision"])
+        finally:
+            os.close(snapshot)
 
     def seal_file(self, record_id: bytes, dataset_name: str, revision: int,
                   source: str, target: str) -> None:
         self._call("seal_file", {
             "record_id": _bytes_field(record_id, "record id"),
-            "name": dataset_name,
-            "revision": int(revision),
-            "source": os.path.abspath(source),
-            "target": os.path.abspath(target),
+            "name": require_text(dataset_name, "dataset name"),
+            "revision": require_revision(revision),
+            "source": os.path.abspath(require_text(source, "source path")),
+            "target": os.path.abspath(require_text(target, "target path")),
         })
 
     def unseal_file(self, record_id: bytes, dataset_name: str,
                     source: str, target: str) -> int:
         reply, fds = self._call("unseal_file", {
             "record_id": _bytes_field(record_id, "record id"),
-            "name": dataset_name,
-            "source": os.path.abspath(source),
-            "target": os.path.abspath(target),
+            "name": require_text(dataset_name, "dataset name"),
+            "source": os.path.abspath(require_text(source, "source path")),
+            "target": os.path.abspath(require_text(target, "target path")),
         })
         close_fds(fds)
         return int(reply["revision"])
@@ -590,8 +672,8 @@ class Watcher:
                  lifetime: int = 30, verbs: int = Verb.READ) -> None:
         if lifetime < 1 or lifetime > 300:
             raise Invalid("lifetime must be from 1 to 300 seconds")
-        self._socket_path = socket_path
-        self._app_id = app_id
+        self._socket_path = require_text(socket_path, "socket path")
+        self._app_id = require_text(app_id, "application id")
         self._callback = callback
         self._lifetime = int(lifetime)
         self._verbs = int(verbs)

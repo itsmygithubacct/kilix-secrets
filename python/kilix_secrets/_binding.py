@@ -25,6 +25,12 @@ IDENTITY_KEY_BYTES = 32
 IDENTITY_ANCHOR_BYTES = 32
 MAX_DATASET_NAME = 128
 MAX_DATASET_BYTES = 64 * 1024 * 1024
+# Matches ksec_dataset_sealed_length at the maximum plaintext and prefix.
+_DATASET_PREFIX_FIXED_BYTES = 68
+_DATASET_CHUNK_BYTES = 65536
+_DATASET_CHUNK_OVERHEAD = 17
+_DATASET_STREAM_HEADER_BYTES = 24
+_UINT64_MAX = (1 << 64) - 1
 RESET_CONFIRMATION = "RESET-VAULT-AND-LOSE-IDENTITY"
 IDENTITY_OWNER = "kilix-pairingd"
 IDENTITY_TYPE = "device-identity"
@@ -507,6 +513,39 @@ def raise_for_result(code: int) -> None:
     raise exc_type(result_string(int(code)), int(code))
 
 
+def require_text(value: object, label: str) -> str:
+    """Reject a value ``c_char_p`` would truncate or refuse to encode."""
+    if not isinstance(value, str):
+        raise Invalid(f"{label} must be text")
+    if "\x00" in value:
+        raise Invalid("text contains a NUL")
+    return value
+
+
+def require_revision(value: object) -> int:
+    """Reject a revision ``c_uint64`` would wrap."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Invalid("revision must be a whole number")
+    if value < 0 or value > _UINT64_MAX:
+        raise Invalid("revision is out of range")
+    return value
+
+
+def max_sealed_dataset_bytes() -> int:
+    """Upper bound of a sealed file for ``KSEC_MAX_DATASET_BYTES`` of plaintext."""
+    chunks = (MAX_DATASET_BYTES + _DATASET_CHUNK_BYTES - 1) // _DATASET_CHUNK_BYTES
+    prefix = _DATASET_PREFIX_FIXED_BYTES + MAX_APP_ID + MAX_DATASET_NAME
+    return (
+        prefix
+        + _DATASET_STREAM_HEADER_BYTES
+        + MAX_DATASET_BYTES
+        + chunks * _DATASET_CHUNK_OVERHEAD
+    )
+
+
+MAX_SEALED_DATASET_BYTES = max_sealed_dataset_bytes()
+
+
 def _id_array(record_id: bytes) -> ctypes.Array:
     if not isinstance(record_id, (bytes, bytearray)) or len(record_id) != RECORD_ID_BYTES:
         raise Invalid("record id must be 16 bytes")
@@ -519,6 +558,60 @@ def _anchor_array(anchor: bytes | None):
     if not isinstance(anchor, (bytes, bytearray)) or len(anchor) != IDENTITY_ANCHOR_BYTES:
         raise Invalid("anchor must be 32 bytes")
     return (ctypes.c_uint8 * IDENTITY_ANCHOR_BYTES).from_buffer_copy(bytes(anchor))
+
+
+def read_input_sealed_memfd(input_fd: int, maximum: int) -> int:
+    """Copy ``input_fd`` through EOF into a sealed memfd. The caller closes it.
+
+    The read stops at ``maximum`` bytes, the same rule as the C client's
+    ``read_input_sealed_memfd``. The caller's descriptor is not read again.
+    """
+    if isinstance(input_fd, bool) or not isinstance(input_fd, int) or input_fd < 0:
+        raise Invalid("input descriptor is invalid")
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        raise Invalid("input limit is invalid")
+    flags = os.MFD_CLOEXEC | getattr(os, "MFD_ALLOW_SEALING", 0)
+    fd = os.memfd_create("ksec-dataset-request", flags)
+    try:
+        total = 0
+        while True:
+            try:
+                chunk = os.read(input_fd, _DATASET_CHUNK_BYTES)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                raise IoError(os.strerror(exc.errno) if exc.errno else "I/O failure") from exc
+            if not chunk:
+                break
+            if len(chunk) > maximum - total:
+                raise LimitExceeded("limit exceeded")
+            view = memoryview(chunk)
+            offset = 0
+            try:
+                while offset < len(view):
+                    try:
+                        wrote = os.write(fd, view[offset:])
+                    except InterruptedError:
+                        continue
+                    except OSError as exc:
+                        raise IoError(
+                            os.strerror(exc.errno) if exc.errno else "I/O failure") from exc
+                    if wrote <= 0:
+                        raise IoError("I/O failure")
+                    offset += wrote
+            finally:
+                view.release()
+            total += len(chunk)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            import fcntl
+            fcntl.fcntl(fd, _F_ADD_SEALS, _F_SEAL)
+        except OSError as exc:
+            raise IoError(os.strerror(exc.errno) if exc.errno else "I/O failure") from exc
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
 
 def secret_memfd(payload: bytes | bytearray) -> int:
@@ -612,13 +705,13 @@ def _build_record(record: Record) -> tuple[_CRecord, list[object]]:
     if record.fields is None or record.grants is None:
         raise Invalid("record fields are missing")
     keep: list[object] = []
-    owner = record.owner.encode()
-    kind = record.type.encode()
-    label = record.label.encode()
+    owner = require_text(record.owner, "owner").encode()
+    kind = require_text(record.type, "type").encode()
+    label = require_text(record.label, "label").encode()
     keep.extend((owner, kind, label))
     fields = (_CField * len(record.fields))()
     for index, field in enumerate(record.fields):
-        name = field.name.encode()
+        name = require_text(field.name, "field name").encode()
         if len(field.value) == 0:
             raise Invalid("field value is empty")
         blob = (ctypes.c_uint8 * len(field.value)).from_buffer_copy(field.value)
@@ -629,7 +722,7 @@ def _build_record(record: Record) -> tuple[_CRecord, list[object]]:
         fields[index].value_len = len(field.value)
     grants = (_CGrant * len(record.grants))()
     for index, grant in enumerate(record.grants):
-        app = grant.application_id.encode()
+        app = require_text(grant.application_id, "application id").encode()
         keep.append(app)
         grants[index].application_id = app
         grants[index].verbs = int(grant.verbs)
@@ -674,7 +767,11 @@ class Client:
         """``ksec_connect_at``. The capability descriptor is always consumed."""
         lib = load_library()
         try:
-            encoded = os.fsencode(socket_path)
+            encoded = os.fsencode(require_text(socket_path, "socket path"))
+        except Invalid:
+            if capability_fd >= 0:
+                os.close(capability_fd)
+            raise
         except (TypeError, ValueError, UnicodeError):
             if capability_fd >= 0:
                 os.close(capability_fd)
@@ -752,12 +849,13 @@ class Client:
             os.close(fd)
 
     def reset_vault(self, confirmation: str, passphrase: bytes | bytearray) -> bytearray:
+        confirmed = require_text(confirmation, "confirmation").encode()
         fd = secret_memfd(passphrase)
 
         def run(out: int) -> None:
             try:
                 raise_for_result(self._lib.ksec_reset_vault(
-                    self._ptr(), confirmation.encode(), fd, out))
+                    self._ptr(), confirmed, fd, out))
             finally:
                 os.close(fd)
 
@@ -782,10 +880,11 @@ class Client:
 
     def get(self, record_id: bytes, field: str, max_len: int | None = None) -> bytearray:
         ident = _id_array(record_id)
+        field_name = require_text(field, "field name").encode()
         if max_len is None:
             def run(out: int) -> None:
                 raise_for_result(self._lib.ksec_get_to_fd(
-                    self._ptr(), ident, field.encode(), out))
+                    self._ptr(), ident, field_name, out))
             return _capture(run, MAX_SECRET_BYTES)
         if max_len <= 0 or max_len > MAX_SECRET_BYTES:
             raise Invalid("get buffer length is out of range")
@@ -793,14 +892,15 @@ class Client:
         got = ctypes.c_size_t(0)
         try:
             raise_for_result(self._lib.ksec_get_buf(
-                self._ptr(), ident, field.encode(), buf, max_len, ctypes.byref(got)))
+                self._ptr(), ident, field_name, buf, max_len, ctypes.byref(got)))
             return bytearray(ctypes.string_at(buf, got.value))
         finally:
             ctypes.memset(buf, 0, max_len)
 
     def get_to_fd(self, record_id: bytes, field: str, output_fd: int) -> None:
         raise_for_result(self._lib.ksec_get_to_fd(
-            self._ptr(), _id_array(record_id), field.encode(), int(output_fd)))
+            self._ptr(), _id_array(record_id),
+            require_text(field, "field name").encode(), int(output_fd)))
 
     def identity_open(self, record_id: bytes, expected_anchor: bytes | None = None) -> IdentityOpen:
         ident = _id_array(record_id)
@@ -852,11 +952,13 @@ class Client:
 
     def grant(self, record_id: bytes, application_id: str, verbs: int) -> None:
         raise_for_result(self._lib.ksec_grant_record(
-            self._ptr(), _id_array(record_id), application_id.encode(), int(verbs)))
+            self._ptr(), _id_array(record_id),
+            require_text(application_id, "application id").encode(), int(verbs)))
 
     def revoke(self, record_id: bytes, application_id: str) -> None:
         raise_for_result(self._lib.ksec_revoke_record(
-            self._ptr(), _id_array(record_id), application_id.encode()))
+            self._ptr(), _id_array(record_id),
+            require_text(application_id, "application id").encode()))
 
     def doctor(self) -> bytes:
         def run(out: int) -> None:
@@ -872,20 +974,23 @@ class Client:
 
     def dataset_create(self, label: str) -> bytes:
         out = (ctypes.c_uint8 * RECORD_ID_BYTES)()
-        raise_for_result(self._lib.ksec_dataset_create(self._ptr(), label.encode(), out))
+        raise_for_result(self._lib.ksec_dataset_create(
+            self._ptr(), require_text(label, "label").encode(), out))
         return bytes(out)
 
     def seal_fd(self, record_id: bytes, dataset_name: str, revision: int,
                 input_fd: int, output_fd: int) -> None:
         raise_for_result(self._lib.ksec_seal_fd(
-            self._ptr(), _id_array(record_id), dataset_name.encode(),
-            int(revision), int(input_fd), int(output_fd)))
+            self._ptr(), _id_array(record_id),
+            require_text(dataset_name, "dataset name").encode(),
+            require_revision(revision), int(input_fd), int(output_fd)))
 
     def unseal_fd(self, record_id: bytes, dataset_name: str,
                   input_fd: int, output_fd: int) -> int:
         revision = ctypes.c_uint64(0)
         raise_for_result(self._lib.ksec_unseal_fd(
-            self._ptr(), _id_array(record_id), dataset_name.encode(),
+            self._ptr(), _id_array(record_id),
+            require_text(dataset_name, "dataset name").encode(),
             int(input_fd), int(output_fd), ctypes.byref(revision)))
         return int(revision.value)
 
@@ -905,13 +1010,15 @@ def mint_for_child(socket_path: str, pid: int, app_id: str, verbs: int,
     """Mint a capability for a child of this process. Returns the descriptor."""
     lib = load_library()
     out = ctypes.c_int(-1)
+    encoded_socket = os.fsencode(require_text(socket_path, "socket path"))
+    encoded_app = require_text(app_id, "application id").encode()
     if record_id is None:
         raise_for_result(lib.ksec_supervisor_mint(
-            os.fsencode(socket_path), int(pid), app_id.encode(),
+            encoded_socket, int(pid), encoded_app,
             int(verbs), int(lifetime), ctypes.byref(out)))
     else:
         raise_for_result(lib.ksec_supervisor_mint_scoped(
-            os.fsencode(socket_path), int(pid), app_id.encode(), int(verbs),
+            encoded_socket, int(pid), encoded_app, int(verbs),
             _id_array(record_id), int(lifetime), ctypes.byref(out)))
     if out.value < 0:
         raise ProtocolError("mint returned no capability descriptor")

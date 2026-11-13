@@ -513,6 +513,68 @@ def test_seal_files(checks: Checks, root: Path) -> None:
                 kill_pid(process.pid)
 
 
+def test_worker_thread_lifetime(checks: Checks, socket_path: Path) -> None:
+    """A worker survives the thread that created the session."""
+    from kilix_secrets import Session, Verb
+    holder: dict[str, object] = {}
+
+    def create() -> None:
+        try:
+            created = Session(str(socket_path), APP, Verb.ALL, 300)
+            holder["session"] = created
+            holder["pid"] = created.worker_pid
+            holder["status"] = created.status()
+        except Exception as exc:
+            holder["error"] = exc
+
+    creator = threading.Thread(target=create)
+    creator.start()
+    creator.join(10)
+    session = holder.get("session")
+    if not isinstance(session, Session) or "error" in holder:
+        checks.check(False, f"short-lived thread created a session ({holder.get('error')})")
+        checks.check(False, "new thread keeps the same worker")
+        if isinstance(session, Session):
+            session.close()
+        return
+    pid = holder.get("pid")
+    first = holder.get("status")
+    time.sleep(0.5)
+    main_error: Exception | None = None
+    again: int | None = None
+    main_pid: int | None = None
+    try:
+        again = session.status()
+        main_pid = session.worker_pid
+    except Exception as exc:
+        main_error = exc
+    later: dict[str, object] = {}
+
+    def call() -> None:
+        try:
+            later["status"] = session.status()
+            later["pid"] = session.worker_pid
+        except Exception as exc:
+            later["error"] = exc
+
+    try:
+        caller = threading.Thread(target=call)
+        caller.start()
+        caller.join(10)
+        checks.check(
+            main_error is None and again == first and main_pid == pid and pid is not None,
+            f"main thread keeps worker {pid} after the creator exits "
+            f"({main_pid}, {again}, {main_error})",
+        )
+        checks.check(
+            "error" not in later and later.get("status") == first and later.get("pid") == pid,
+            f"new thread keeps worker {pid} ({later.get('pid')}, {later.get('status')}, "
+            f"{later.get('error')})",
+        )
+    finally:
+        session.close()
+
+
 def test_worker(checks: Checks, socket_path: Path) -> None:
     from kilix_secrets import Verb
     from kilix_secrets._protocol import close_fds
@@ -538,6 +600,8 @@ def test_worker(checks: Checks, socket_path: Path) -> None:
                      "worker stays up after refusing a method")
     finally:
         worker.close()
+
+    test_worker_thread_lifetime(checks, socket_path)
 
     holder = subprocess.Popen(
         [sys.executable, __file__, "--role", "parent-holder", str(socket_path)],
@@ -887,6 +951,120 @@ def test_vault(checks: Checks, socket_path: Path) -> None:
                 item.close()
 
 
+def _rejected_seal_arguments(checks: Checks, session, record_id: bytes, root: Path) -> None:
+    from kilix_secrets import Invalid
+    arg_src = root / "arg-src"
+    arg_src.write_bytes(b"ARG-PLAIN")
+    arg_src.chmod(0o600)
+    arg_out = root / "arg-out"
+    arg_out.write_bytes(b"")
+    arg_out.chmod(0o600)
+    src_fd = os.open(arg_src, os.O_RDONLY | os.O_CLOEXEC)
+    out_fd = os.open(arg_out, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        expect(checks, Invalid, "text contains a NUL",
+               lambda: session.seal_fd(record_id, "book\x00evil", 1, src_fd, out_fd))
+        expect(checks, Invalid, "revision is out of range",
+               lambda: session.seal_fd(record_id, "book", -1, src_fd, out_fd))
+        expect(checks, Invalid, "revision is out of range",
+               lambda: session.seal_fd(record_id, "book", 2**64, src_fd, out_fd))
+        expect(checks, Invalid, "text contains a NUL",
+               lambda: session.dataset_create("py\x00dataset"))
+    finally:
+        os.close(src_fd)
+        os.close(out_fd)
+    checks.check(arg_out.stat().st_size == 0, "rejected seal arguments write nothing")
+
+
+def _write_paused(write_fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    half = len(view) // 2
+    off = 0
+    try:
+        while off < half:
+            off += os.write(write_fd, view[off:half])
+        time.sleep(2.5)
+        while off < len(view):
+            off += os.write(write_fd, view[off:])
+    finally:
+        os.close(write_fd)
+        view.release()
+
+
+def _expiring_seal_round_trip(checks: Checks, session, record_id: bytes, root: Path) -> None:
+    from kilix_secrets import Session, Verb, seal_file, unseal_file
+    pipe_plain = b"retry-pipe-" + os.urandom(64 * 1024)
+    short = Session(session._socket_path, APP, Verb.ALL, lifetime=2)
+    read_fd, write_fd = os.pipe()
+    sealed_path = root / "retry-pipe.sealed"
+    plain_path = root / "retry-pipe.plain"
+    writer = threading.Thread(target=_write_paused, args=(write_fd, pipe_plain))
+    writer.start()
+    out = os.open(sealed_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    ok = False
+    detail = "no result"
+    try:
+        try:
+            short.seal_fd(record_id, "retry-pipe", 7, read_fd, out)
+        except Exception as exc:
+            detail = f"raised {type(exc).__name__}: {exc}"
+        else:
+            os.close(out)
+            out = -1
+            os.close(read_fd)
+            read_fd = -1
+            writer.join(timeout=5)
+            rev = session.unseal_file(
+                record_id, "retry-pipe", str(sealed_path), str(plain_path))
+            got = plain_path.read_bytes()
+            ok = rev == 7 and got == pipe_plain
+            detail = f"revision {rev} unsealed {len(got)} of {len(pipe_plain)}"
+    finally:
+        if out >= 0:
+            os.close(out)
+        if read_fd >= 0:
+            os.close(read_fd)
+        short.close()
+        writer.join(timeout=5)
+    checks.check(ok, f"expiring seal_fd round-trips the pipe plaintext ({detail})")
+
+    file_plain = b"retry-file-" + os.urandom(32 * 1024)
+    fifo = root / "retry.fifo"
+    os.mkfifo(fifo, 0o600)
+    target = root / "retry-file.sealed"
+    opened = root / "retry-file.plain"
+    file_session = Session(session._socket_path, APP, Verb.ALL, lifetime=2)
+
+    def produce() -> None:
+        fd = os.open(fifo, os.O_WRONLY)
+        _write_paused(fd, file_plain)
+
+    producer = threading.Thread(target=produce)
+    producer.start()
+    ok = False
+    detail = "no result"
+    try:
+        try:
+            seal_file(file_session, record_id, "retry-file", 3, str(fifo), str(target))
+        except Exception as exc:
+            detail = f"raised {type(exc).__name__}: {exc}"
+        else:
+            rev = unseal_file(session, record_id, "retry-file", str(target), str(opened))
+            got = opened.read_bytes()
+            ok = rev == 3 and got == file_plain
+            detail = f"revision {rev} unsealed {len(got)} of {len(file_plain)}"
+    finally:
+        file_session.close()
+        if producer.is_alive():
+            try:
+                dummy = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+                os.close(dummy)
+            except OSError:
+                pass
+        producer.join(timeout=5)
+    checks.check(ok, f"expiring seal_file round-trips the fifo plaintext ({detail})")
+
+
 def test_datasets(checks: Checks, session) -> None:
     from kilix_secrets import Denied, NotFound, Verb, Session
     record_id = session.dataset_create("py-dataset")
@@ -926,6 +1104,8 @@ def test_datasets(checks: Checks, session) -> None:
                    lambda: reader.seal_file(record_id, "py-notes", 1, str(source), str(other)))
         finally:
             reader.close()
+        _rejected_seal_arguments(checks, session, record_id, root)
+        _expiring_seal_round_trip(checks, session, record_id, root)
         session.delete(record_id)
         missing = root / "missing"
         expect(checks, NotFound, "not found",
