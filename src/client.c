@@ -974,14 +974,46 @@ ksec_result ksec_unseal_fd(ksec_client *client,
     return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L2) */
 }
 
-/* ---- Status and watch: client side (lane L3). SKELETON stubs. ---- */
+/* ---- Status and watch: client side (lane L3). ---- */
 
 ksec_result ksec_status(ksec_client *client, uint32_t *flags) {
-    (void)client; (void)flags;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    uint8_t response[8];
+    size_t length = 0U;
+    ksec_result result;
+    if (flags == NULL) return KSEC_ERR_INVALID;
+    *flags = 0U;
+    if (client == NULL) return KSEC_ERR_INVALID;
+    memset(response, 0, sizeof response);
+    result = simple_request(client, KSEC_OP_STATUS, NULL, 0U, NULL,
+                            response, sizeof response, &length);
+    if (result != KSEC_OK) return result;
+    if (length != sizeof response
+            || ksec_get_u32(response) != KSEC_STATUS_VERSION) {
+        return KSEC_ERR_PROTOCOL;
+    }
+    *flags = ksec_get_u32(response + 4U);
+    return KSEC_OK;
 }
 
 ksec_result ksec_watch(ksec_client *client, int *watch_fd) {
-    (void)client; (void)watch_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    uint8_t response[1];
+    size_t length = 0U;
+    int fd = -1;
+    ksec_result result;
+    if (watch_fd == NULL) return KSEC_ERR_INVALID;
+    *watch_fd = -1;
+    if (client == NULL) return KSEC_ERR_INVALID;
+    result = simple_request(client, KSEC_OP_WATCH, NULL, 0U, &fd,
+                            response, sizeof response, &length);
+    if (result != KSEC_OK) return result;
+    if (length != 0U || fd < 0) {
+        if (fd >= 0) (void)close(fd);
+        return KSEC_ERR_PROTOCOL;
+    }
+    if (ksec_set_cloexec(fd, true) != 0 || ksec_set_nonblock(fd, true) != 0) {
+        (void)close(fd);
+        return KSEC_ERR_IO;
+    }
+    *watch_fd = fd;
+    return KSEC_OK;
 }

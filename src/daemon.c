@@ -37,6 +37,13 @@ typedef struct {
 } identity_lease;
 
 typedef struct {
+    bool active;
+    int daemon_fd;
+    int connection_fd;
+    ksec_capability *capability;
+} vault_watch;
+
+typedef struct {
     ksec_store store;
     ksec_vault_header header;
     ksec_secure_buffer master;
@@ -56,6 +63,7 @@ typedef struct {
     uint64_t last_authorized_use;
     ksec_session_monitor *session_monitor;
     identity_lease identity_leases[KSEC_MAX_IDENTITY_LEASES];
+    vault_watch watches[KSEC_MAX_WATCHES];
 } daemon_state;
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -269,6 +277,88 @@ static size_t identity_lease_count(const daemon_state *state) {
     return count;
 }
 
+static void close_watch(vault_watch *watch) {
+    if (watch == NULL || !watch->active) return;
+    if (watch->daemon_fd >= 0) (void)close(watch->daemon_fd);
+    sodium_memzero(watch, sizeof *watch);
+}
+
+static void invalidate_all_watches(daemon_state *state) {
+    size_t index;
+    if (state == NULL) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        close_watch(&state->watches[index]);
+    }
+}
+
+static void invalidate_connection_watches(daemon_state *state,
+                                          int connection_fd) {
+    size_t index;
+    if (state == NULL || connection_fd < 0) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        vault_watch *watch = &state->watches[index];
+        if (watch->active && watch->connection_fd == connection_fd) {
+            close_watch(watch);
+        }
+    }
+}
+
+static size_t watch_count(const daemon_state *state) {
+    size_t index;
+    size_t count = 0U;
+    if (state == NULL) return 0U;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        if (state->watches[index].active) count++;
+    }
+    return count;
+}
+
+/* Live means activated and unexpired, with the same process identity the
+ * capability was minted for. No verb and no record scope: STATUS and WATCH
+ * are not authorized operations. */
+static ksec_result capability_is_live(const ksec_capability *capability) {
+    uint64_t target_start = 0U;
+    uint64_t supervisor_start = 0U;
+    if (capability == NULL || !capability->active || !capability->activated
+            || capability->connection_fd < 0
+            || capability->expires_at <= ksec_now_seconds()) {
+        return KSEC_ERR_DENIED;
+    }
+    if (ksec_process_start_time(capability->target_pid, &target_start) != 0
+            || ksec_process_start_time(capability->supervisor_pid,
+                                       &supervisor_start) != 0
+            || target_start != capability->target_start_time
+            || supervisor_start != capability->supervisor_start_time) {
+        return KSEC_ERR_DENIED;
+    }
+    return KSEC_OK;
+}
+
+static void expire_watches(daemon_state *state) {
+    size_t index;
+    if (state == NULL) return;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        vault_watch *watch = &state->watches[index];
+        struct pollfd descriptor;
+        int ready;
+        if (!watch->active) continue;
+        descriptor.fd = watch->daemon_fd;
+        descriptor.events = POLLIN;
+        descriptor.revents = 0;
+        ready = poll(&descriptor, 1U, 0);
+        if ((ready > 0
+                && (descriptor.revents
+                    & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                || (ready < 0 && errno != EINTR)) {
+            close_watch(watch);
+            continue;
+        }
+        if (capability_is_live(watch->capability) != KSEC_OK) {
+            close_watch(watch);
+        }
+    }
+}
+
 static void expire_identity_leases(daemon_state *state) {
     size_t index;
     if (state == NULL) return;
@@ -305,6 +395,7 @@ static void expire_identity_leases(daemon_state *state) {
 static void lock_state(daemon_state *state) {
     if (state == NULL) return;
     invalidate_all_identity_leases(state);
+    invalidate_all_watches(state);
     ksec_secure_free(&state->master);
     ksec_store_clear_records(&state->store);
     ksec_policy_clear(&state->policy);
@@ -852,6 +943,7 @@ static ksec_result handle_rotate_master(
     state->master = new_master;
     memset(&new_master, 0, sizeof new_master);
     invalidate_all_identity_leases(state);
+    invalidate_all_watches(state);
     (void)audit_state_event(state, "master-rotation", "ok",
                             connection->uid, connection->pid, app_id, NULL);
     ksec_policy_clear(&state->policy);
@@ -1714,17 +1806,60 @@ static ksec_result handle_status(daemon_state *state,
                                  size_t payload_len, int received_fd,
                                  uint8_t response[KSEC_RECORD_ID_BYTES],
                                  size_t *response_len) {
-    (void)state; (void)connection; (void)payload_len; (void)received_fd;
-    (void)response; (void)response_len;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    uint32_t flags = 0U;
+    ksec_result result;
+    if (state == NULL || connection == NULL || response == NULL
+            || response_len == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    if (payload_len != 0U || received_fd >= 0) return KSEC_ERR_PROTOCOL;
+    result = capability_is_live(connection->capability);
+    if (result != KSEC_OK) return result;
+    if (state->initialized) {
+        flags |= KSEC_STATUS_INITIALIZED;
+        if ((state->header.flags & KSEC_HEADER_FLAG_RECOVERY_CONFIRMED) != 0U) {
+            flags |= KSEC_STATUS_RECOVERY_CONFIRMED;
+        }
+    }
+    if (state->unlocked) flags |= KSEC_STATUS_UNLOCKED;
+    ksec_put_u32(response, KSEC_STATUS_VERSION);
+    ksec_put_u32(response + 4U, flags);
+    *response_len = 8U;
+    return KSEC_OK;
 }
 
 static ksec_result handle_watch(daemon_state *state, daemon_connection *connection,
                                 size_t payload_len, int received_fd,
                                 int *reply_fd) {
-    (void)state; (void)connection; (void)payload_len; (void)received_fd;
-    (void)reply_fd;
-    return KSEC_ERR_PROTOCOL; /* PLACEHOLDER (lane L3) */
+    vault_watch *slot = NULL;
+    int pair[2] = {-1, -1};
+    size_t index;
+    ksec_result result;
+    if (state == NULL || connection == NULL || reply_fd == NULL) {
+        return KSEC_ERR_INVALID;
+    }
+    if (payload_len != 0U || received_fd >= 0) return KSEC_ERR_PROTOCOL;
+    result = capability_is_live(connection->capability);
+    if (result != KSEC_OK) return result;
+    if (!state->unlocked) return KSEC_ERR_LOCKED;
+    if (watch_count(state) >= KSEC_MAX_WATCHES) return KSEC_ERR_LIMIT;
+    for (index = 0U; index < KSEC_MAX_WATCHES; index++) {
+        if (!state->watches[index].active) {
+            slot = &state->watches[index];
+            break;
+        }
+    }
+    if (slot == NULL) return KSEC_ERR_LIMIT;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) {
+        return KSEC_ERR_IO;
+    }
+    memset(slot, 0, sizeof *slot);
+    slot->active = true;
+    slot->daemon_fd = pair[0];
+    slot->connection_fd = connection->fd;
+    slot->capability = connection->capability;
+    *reply_fd = pair[1];
+    return KSEC_OK;
 }
 
 static ksec_result handle_doctor(daemon_state *state, daemon_connection *connection,
@@ -1976,6 +2111,7 @@ static int accept_connection(int listener, daemon_connection *connection) {
 static void close_connection(daemon_state *state, daemon_connection *connection) {
     if (connection->fd >= 0) {
         invalidate_connection_identity_leases(state, connection->fd);
+        invalidate_connection_watches(state, connection->fd);
         ksec_policy_disconnect(&state->policy, connection->fd);
         (void)close(connection->fd);
     }
@@ -2021,6 +2157,7 @@ static int serve(int listener, daemon_state *state) {
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) return -1;
         expire_identity_leases(state);
+        expire_watches(state);
         if ((pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
                 || ksec_session_monitor_process(state->session_monitor) != 0) {
             lock_state(state);
