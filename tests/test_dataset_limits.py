@@ -557,6 +557,50 @@ def rss_anon_kib(pid: int) -> int:
     raise RuntimeError(f"RssAnon missing for pid {pid}")
 
 
+def process_state(pid: int) -> str:
+    # Dumpable is cleared, so /proc/PID/fd is root-only. stat stays readable.
+    text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    return text.rsplit(")", 1)[1].split()[0]
+
+
+def seal_output_waiting(client: Client) -> bool:
+    if client.proc.poll() is not None:
+        return True
+    if b"RESULT" in client.reader.pending or b"SETUP" in client.reader.pending:
+        return True
+    try:
+        ready, _, _ = select.select([client.reader.fd], [], [], 0)
+    except (InterruptedError, ValueError, OSError):
+        return True
+    return bool(ready)
+
+
+def wait_for_seal_request(pid: int, seal_client: Client, timeout: float) -> bool:
+    """True once the daemon is running, not parked in poll, across a short window.
+
+    The client reads the plaintext before it connects. A poll wakeup is one
+    running sample; four inside 50 ms means the single-threaded seal is in
+    progress and has not returned to poll.
+    """
+    deadline = time.monotonic() + timeout
+    running: list[float] = []
+    while time.monotonic() < deadline:
+        if seal_output_waiting(seal_client):
+            return False
+        now = time.monotonic()
+        try:
+            state = process_state(pid)
+        except OSError:
+            return False
+        if state == "R":
+            running.append(now)
+        running = [sample for sample in running if now - sample <= 0.05]
+        if len(running) >= 4:
+            return True
+        time.sleep(0.005)
+    return False
+
+
 class RssSampler:
     def __init__(self, pid: int) -> None:
         self.pid = pid
@@ -911,13 +955,20 @@ def main() -> int:
                 60, lambda item: item == "SEALING" or item.startswith("SETUP")
                 or item.startswith("RESULT"))
             checks.check(sealing == "SEALING", f"seal reports it has started ({sealing})")
+            seal_in_daemon = False
+            if sealing == "SEALING":
+                seal_in_daemon = wait_for_seal_request(
+                    process.pid, seal_client, 120.0)
             if (sealing == "SEALING" and ready == "READY"
                     and status_client is not None
                     and status_client.proc.stdin is not None):
+                overlap = ("daemon held the seal request"
+                           if seal_in_daemon else
+                           "seal request was not held when STATUS was issued")
                 status_client.proc.stdin.write(b"G")
                 status_client.proc.stdin.flush()
                 status_line = status_client.wait_for(
-                    30, lambda item: item.startswith("RESULT") or item.startswith("SETUP"))
+                    180, lambda item: item.startswith("RESULT") or item.startswith("SETUP"))
                 status_parsed = parse_result(status_line)
                 status_code, status_err = status_client.finish(10)
                 clients.remove(status_client)
@@ -927,7 +978,7 @@ def main() -> int:
                     status_text = "no result"
                 else:
                     status_seconds = status_parsed[1]
-                    status_text = f"{status_seconds:.3f}"
+                    status_text = f"{status_seconds:.3f} ({overlap})"
                     checks.check(status_code == 0 and status_parsed[0] == KSEC_OK,
                                  "status during seal returns ok "
                                  f"(code={status_parsed[0]} {tail(status_err)})")
