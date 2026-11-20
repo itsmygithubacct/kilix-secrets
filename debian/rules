@@ -1,0 +1,49 @@
+#!/usr/bin/make -f
+# kilix-secrets, libkilix-secrets0 and libkilix-secrets-dev from one build.
+# The daemon and the CLI keep linking the static library. The shared library
+# is the client other programs link. A /usr/local developer install is not
+# changed: this file is what places the payload under /usr and rewrites the
+# one developer path in the user unit.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/dpkg/architecture.mk
+export CPPFLAGS CFLAGS LDFLAGS
+
+LIBDIR := /usr/lib/$(DEB_HOST_MULTIARCH)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- PREFIX=/usr
+
+# The repository suite is the test gate. It needs a private TMPDIR and, in
+# one consumer compile, the host multiarch libsodium path. The package build
+# itself stays a compile and an install.
+override_dh_auto_test:
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp PREFIX=/usr LIBDIR=$(LIBDIR)
+	grep -qx 'ExecStart=/usr/local/bin/kilix-secretsd --systemd --data-dir %h/.local/share/kilix-secrets' \
+		debian/tmp/usr/lib/systemd/user/kilix-secrets.service
+	sed -i 's|^ExecStart=/usr/local/bin/|ExecStart=/usr/bin/|' \
+		debian/tmp/usr/lib/systemd/user/kilix-secrets.service
+	grep -qx 'ExecStart=/usr/bin/kilix-secretsd --systemd --data-dir %h/.local/share/kilix-secrets' \
+		debian/tmp/usr/lib/systemd/user/kilix-secrets.service
+	sed -i 's|^libdir=.*|libdir=$${exec_prefix}/lib/$(DEB_HOST_MULTIARCH)|' \
+		debian/tmp$(LIBDIR)/pkgconfig/kilix-secrets.pc
+	grep -qx 'libdir=$${exec_prefix}/lib/$(DEB_HOST_MULTIARCH)' \
+		debian/tmp$(LIBDIR)/pkgconfig/kilix-secrets.pc
+
+# The socket is the activation path, matching a global enable of
+# kilix-secrets.socket. The service has no [Install] section and is not
+# enabled. --no-enable keeps the helper from enabling either unit. The
+# socket symlink is created afterwards, in the package, so the socket is
+# enabled without a maintainer script.
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable
+	install -d debian/kilix-secrets/usr/lib/systemd/user/sockets.target.wants
+	ln -sfn ../kilix-secrets.socket \
+		debian/kilix-secrets/usr/lib/systemd/user/sockets.target.wants/kilix-secrets.socket
+	test ! -e debian/kilix-secrets/usr/lib/systemd/user/default.target.wants/kilix-secrets.service

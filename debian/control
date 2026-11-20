@@ -1,0 +1,46 @@
+Source: kilix-secrets
+Section: utils
+Priority: optional
+Maintainer: itsmygithubacct <itsmygithubacct@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+ pkgconf,
+ libsodium-dev,
+ libsystemd-dev
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/itsmygithubacct/kilix-secrets
+Vcs-Git: https://github.com/itsmygithubacct/kilix-secrets.git
+Vcs-Browser: https://github.com/itsmygithubacct/kilix-secrets
+
+Package: kilix-secrets
+Architecture: any
+Depends: libkilix-secrets0 (= ${binary:Version}),
+ ${shlibs:Depends}, ${misc:Depends}
+Description: per-user credential vault for Kilix
+ Kilix Secrets is a per-user daemon and an administrative CLI for encrypted
+ local credentials. The daemon is socket-activated from the user session.
+ Vault files stay under ~/.local/share/kilix-secrets.
+ .
+ The client library is libkilix-secrets0. Headers are in
+ libkilix-secrets-dev.
+
+Package: libkilix-secrets0
+Architecture: any
+Section: libs
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Breaks: kilix-secrets (<< 0.1.0+packaging1)
+Replaces: kilix-secrets (<< 0.1.0+packaging1)
+Description: client library for the Kilix Secrets vault
+ Shared library for programs that ask the per-user Kilix Secrets daemon for
+ credentials. The daemon keeps the encrypted store; this library is the
+ client.
+
+Package: libkilix-secrets-dev
+Architecture: any
+Section: libdevel
+Depends: libkilix-secrets0 (= ${binary:Version}), ${misc:Depends}
+Breaks: kilix-secrets (<< 0.1.0+packaging1)
+Replaces: kilix-secrets (<< 0.1.0+packaging1)
+Description: development files for the Kilix Secrets client library
+ Header, static library and pkg-config file for building against
+ libkilix-secrets0.

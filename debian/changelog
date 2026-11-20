@@ -1,0 +1,9 @@
+kilix-secrets (0.1.0+packaging1) UNRELEASED; urgency=medium
+
+  * Split the Debian package into kilix-secrets, libkilix-secrets0 and
+    libkilix-secrets-dev. The daemon and CLI stay statically linked. The
+    shared library installs on the multiarch path. The user socket is
+    enabled from the package; the service is not. Developer installs under
+    /usr/local are unchanged, including the single-package `make deb`.
+
+ -- itsmygithubacct <itsmygithubacct@users.noreply.github.com>  Fri, 20 Nov 2026 04:05:12 +0000

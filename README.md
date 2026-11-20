@@ -37,10 +37,17 @@ make deb-test TEST_TMPDIR=/path/to/private-scratch
 
 Packagers may override `SODIUM_CPPFLAGS` and `SODIUM_LDLIBS` when building
 against an unpacked, independently verified sysroot.
-`make deb` produces a reproducible, source-bound Debian package in `dist/` and
-refuses a dirty source tree. `make deb-test` additionally exercises dpkg
+`make deb` produces one reproducible, source-bound Debian package in `dist/`
+and refuses a dirty source tree. `make deb-test` additionally exercises dpkg
 install, upgrade, rollback, remove, reinstall, and purge in an isolated root;
 package removal and purge preserve user vault data.
+
+The archive packages are the three built from `debian/`: `kilix-secrets`
+(daemon, CLI and the user socket), `libkilix-secrets0` (the shared client
+library) and `libkilix-secrets-dev`. `dpkg-buildpackage -b` builds them.
+`LIBDIR` selects the library directory; the default remains `$(PREFIX)/lib`.
+The user unit shipped by `make install` keeps its `/usr/local` executable
+path. `debian/rules` is what rewrites that path for the archive packages.
 
 The administrative CLI includes `init`, `unlock`, `lock`, `passwd`, `add`,
 `show`, `grant`, `revoke`, `copy`, `run`, `list`, `delete`, `rotate`, `export`,
