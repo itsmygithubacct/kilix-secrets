@@ -1,0 +1,3 @@
+# unseal name is DEL
+kind=dsreq-unseal
+hex=4444444444444444444444444444444400017f

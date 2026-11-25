@@ -84,12 +84,63 @@ static ksec_result parse_backup(const uint8_t *data, size_t length) {
                                                 &vault_len, &journal_len);
 }
 
+static ksec_result parse_dataset(const uint8_t *data, size_t length) {
+    ksec_dataset_header_info info;
+    size_t prefix_length = 0U;
+    ksec_result result;
+    memset(&info, 0, sizeof info);
+    result = ksec_dataset_parse_prefix(data, length, &info, &prefix_length);
+    sodium_memzero(&info, sizeof info);
+    sodium_memzero(&prefix_length, sizeof prefix_length);
+    return result;
+}
+
+static ksec_result parse_dsreq_create(const uint8_t *data, size_t length) {
+    char label[KSEC_MAX_LABEL + 1U];
+    ksec_result result;
+    memset(label, 0, sizeof label);
+    result = ksec_dataset_parse_create_request(data, length, label);
+    sodium_memzero(label, sizeof label);
+    return result;
+}
+
+static ksec_result parse_dsreq_seal(const uint8_t *data, size_t length) {
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    char name[KSEC_MAX_DATASET_NAME + 1U];
+    uint64_t revision = 0U;
+    ksec_result result;
+    memset(record_id, 0, sizeof record_id);
+    memset(name, 0, sizeof name);
+    result = ksec_dataset_parse_seal_request(data, length, record_id,
+                                             &revision, name);
+    sodium_memzero(record_id, sizeof record_id);
+    sodium_memzero(name, sizeof name);
+    sodium_memzero(&revision, sizeof revision);
+    return result;
+}
+
+static ksec_result parse_dsreq_unseal(const uint8_t *data, size_t length) {
+    uint8_t record_id[KSEC_RECORD_ID_BYTES];
+    char name[KSEC_MAX_DATASET_NAME + 1U];
+    ksec_result result;
+    memset(record_id, 0, sizeof record_id);
+    memset(name, 0, sizeof name);
+    result = ksec_dataset_parse_unseal_request(data, length, record_id, name);
+    sodium_memzero(record_id, sizeof record_id);
+    sodium_memzero(name, sizeof name);
+    return result;
+}
+
 static void exercise_all(const uint8_t *data, size_t length) {
     (void)parse_protocol(data, length);
     (void)parse_header(data, length);
     (void)parse_record(data, length);
     (void)parse_ad(data, length);
     (void)parse_backup(data, length);
+    (void)parse_dataset(data, length);
+    (void)parse_dsreq_create(data, length);
+    (void)parse_dsreq_seal(data, length);
+    (void)parse_dsreq_unseal(data, length);
 }
 
 static int read_exact_or_eof(uint8_t *buffer, size_t length, int eof_ok) {
@@ -147,8 +198,15 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "ad-reject") == 0) result = parse_ad(data, length);
     else if (strcmp(argv[1], "backup-reject") == 0) {
         result = parse_backup(data, length);
-    }
-    else {
+    } else if (strcmp(argv[1], "dataset-reject") == 0) {
+        result = parse_dataset(data, length);
+    } else if (strcmp(argv[1], "dsreq-create-reject") == 0) {
+        result = parse_dsreq_create(data, length);
+    } else if (strcmp(argv[1], "dsreq-seal-reject") == 0) {
+        result = parse_dsreq_seal(data, length);
+    } else if (strcmp(argv[1], "dsreq-unseal-reject") == 0) {
+        result = parse_dsreq_unseal(data, length);
+    } else {
         sodium_memzero(data, length);
         free(data);
         return 2;

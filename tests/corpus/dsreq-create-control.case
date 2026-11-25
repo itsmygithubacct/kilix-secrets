@@ -1,0 +1,3 @@
+# create label is a control byte
+kind=dsreq-create
+hex=000101

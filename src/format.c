@@ -19,7 +19,8 @@ ksec_result ksec_format_record_ad(uint16_t object_type,
             || revision == 0 || plaintext_length == 0
             || (object_type != KSEC_OBJECT_SECRET
                 && object_type != KSEC_OBJECT_DEVICE_IDENTITY
-                && object_type != KSEC_OBJECT_BACKUP_METADATA)) {
+                && object_type != KSEC_OBJECT_BACKUP_METADATA
+                && object_type != KSEC_OBJECT_DATASET_KEY)) {
         return KSEC_ERR_INVALID;
     }
     owner_length = strlen(owner);
@@ -56,7 +57,7 @@ ksec_result ksec_parse_record_ad(const uint8_t *input, size_t input_length,
     if (ksec_get_u16(input + offset) != KSEC_FORMAT_VERSION) return KSEC_ERR_INVALID;
     offset += 2U;
     *object_type = ksec_get_u16(input + offset); offset += 2U;
-    if (*object_type < KSEC_OBJECT_SECRET || *object_type > KSEC_OBJECT_BACKUP_METADATA) return KSEC_ERR_INVALID;
+    if (*object_type < KSEC_OBJECT_SECRET || *object_type > KSEC_OBJECT_DATASET_KEY) return KSEC_ERR_INVALID;
     if (ksec_get_u16(input + offset) != KSEC_KDF_ID_BLAKE2B) return KSEC_ERR_INVALID;
     offset += 2U;
     if (ksec_get_u16(input + offset) != KSEC_AEAD_ID_XCHACHA20POLY1305) return KSEC_ERR_INVALID;

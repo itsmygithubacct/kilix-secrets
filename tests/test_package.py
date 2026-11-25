@@ -55,6 +55,12 @@ def run_make(source: Path, target: str, build: Path,
     )
 
 
+def local_binding_dir() -> str:
+    """Relative directory Debian's python3 -I searches under /usr/local."""
+    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    return f"lib/python{version}/dist-packages"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", required=True)
@@ -81,12 +87,18 @@ def main() -> int:
         "share/doc/kilix-secrets/THIRD_PARTY_NOTICES.md",
         "share/doc/kilix-secrets/DEPENDENCIES.md",
         "share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md",
+        f"{local_binding_dir()}/kilix_secrets/__init__.py",
+        f"{local_binding_dir()}/kilix_secrets/_binding.py",
+        f"{local_binding_dir()}/kilix_secrets/_files.py",
+        f"{local_binding_dir()}/kilix_secrets/_protocol.py",
+        f"{local_binding_dir()}/kilix_secrets/_session.py",
+        f"{local_binding_dir()}/kilix_secrets/worker.py",
     }
     try:
         installed = run_make(source, "install", build, stage)
         first = snapshot(prefix)
         checks.check(installed.returncode == 0 and set(first) == expected,
-                     "staged install produces the exact 13/13-file manifest")
+                     "staged install produces the exact 19/19-file manifest")
         checks.check(first.get("lib/libkilix-secrets.so", ("", 0, ""))[0]
                      == "link"
                      and first["lib/libkilix-secrets.so"][2]
@@ -97,7 +109,10 @@ def main() -> int:
                      or name == "lib/libkilix-secrets.so.0" else 0o644)
             for name, (kind, mode, _) in first.items() if kind == "file"
         )
-        checks.check(modes_ok, "all 12/12 installed regular-file modes are exact")
+        checks.check(modes_ok, "all 18/18 installed regular-file modes are exact")
+        pc_text = (prefix / "lib/pkgconfig/kilix-secrets.pc").read_text(encoding="ascii")
+        checks.check("\nVersion: 0.2.0\n" in f"\n{pc_text}",
+                     "installed pkg-config version is 0.2.0")
 
         needed_daemon = subprocess.run(
             ["readelf", "-d", str(prefix / "bin/kilix-secretsd")],
@@ -143,6 +158,28 @@ def main() -> int:
         checks.check(verified.returncode == 0,
                      "socket/service syntax passes systemd verification with a test-only executable")
 
+        interpreter = subprocess.run(
+            ["python3", "-I", "-c", "import sys; print('\\n'.join(sys.path))"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        searched = interpreter.stdout.decode().splitlines()
+        binding_dir = prefix / local_binding_dir()
+        checks.check(interpreter.returncode == 0
+                     and f"/usr/local/{local_binding_dir()}" in searched
+                     and "/usr/local/lib/python3/dist-packages" not in searched,
+                     "python3 -I searches the versioned /usr/local binding directory")
+        imported = subprocess.run(
+            ["python3", "-I", "-B", "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import kilix_secrets; "
+             "raise SystemExit(0 if kilix_secrets.__file__.startswith(sys.argv[1]) else 1)",
+             str(binding_dir)],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        checks.check(imported.returncode == 0,
+                     "python3 -I imports the staged /usr/local binding")
+
         fixture = root / "consumer.c"
         fixture.write_text(
             "#include <kilix_secrets.h>\n"
@@ -185,7 +222,7 @@ def main() -> int:
         vault_path.chmod(0o600)
         uninstalled = run_make(source, "uninstall", build, stage)
         checks.check(uninstalled.returncode == 0 and snapshot(prefix) == {},
-                     "uninstall removes 13/13 package files from the staged prefix")
+                     "uninstall removes 19/19 package files from the staged prefix")
         checks.check(vault_path.read_bytes() == vault_bytes,
                      "uninstall preserves the 1/1 synthetic user vault by default")
 

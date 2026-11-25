@@ -1,0 +1,3 @@
+# unseal name followed by a trailing byte
+kind=dsreq-unseal
+hex=4444444444444444444444444444444400026f6bff

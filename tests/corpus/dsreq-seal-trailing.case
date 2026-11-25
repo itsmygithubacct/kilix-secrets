@@ -1,0 +1,3 @@
+# seal name followed by a trailing byte
+kind=dsreq-seal
+hex=33333333333333333333333333333333000000000000000100026f6b00

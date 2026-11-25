@@ -165,11 +165,41 @@ int ksec_parent_directory(const char *path, char *output, size_t output_size) {
     return 0;
 }
 
+/* A sandboxed user service runs in a user namespace that maps only its own
+ * uid. Root-owned directories then report the kernel's overflow uid instead
+ * of 0. Returns that uid when root has no mapping here, and 0 when root is
+ * mapped or the mapping cannot be read, so the strict rule stays the default. */
+static uid_t unmapped_root_owner(void) {
+    FILE *map = fopen("/proc/self/uid_map", "re");
+    unsigned long inside, outside, count, overflow = 65534UL;
+    bool any = false;
+    FILE *limit;
+    if (map == NULL) return 0U;
+    while (fscanf(map, "%lu %lu %lu", &inside, &outside, &count) == 3) {
+        any = true;
+        if (inside == 0UL && count > 0UL) {
+            fclose(map);
+            return 0U;
+        }
+    }
+    fclose(map);
+    if (!any) return 0U;
+    limit = fopen("/proc/sys/kernel/overflowuid", "re");
+    if (limit != NULL) {
+        if (fscanf(limit, "%lu", &overflow) != 1 || overflow == 0UL) overflow = 65534UL;
+        fclose(limit);
+    }
+    return (uid_t)overflow;
+}
+
 int ksec_validate_secure_directory(const char *path, bool require_user_leaf) {
     char current[4096];
     size_t length;
     size_t index;
     size_t segment_start = 1U;
+    /* Unmapped owners are accepted only on directories nobody else can write:
+     * the sticky world-writable exception below still needs a real uid 0. */
+    uid_t unmapped_root = unmapped_root_owner();
     if (path == NULL || path[0] != '/') return -1;
     length = strlen(path);
     if (length <= 1U || length >= sizeof current || path[length - 1U] == '/') return -1;
@@ -187,7 +217,8 @@ int ksec_validate_secure_directory(const char *path, bool require_user_leaf) {
         current[index] = '\0';
         if (lstat(current, &status) != 0 || !S_ISDIR(status.st_mode)
                 || S_ISLNK(status.st_mode)
-                || (status.st_uid != 0U && status.st_uid != getuid())) return -1;
+                || (status.st_uid != 0U && status.st_uid != getuid()
+                    && (unmapped_root == 0U || status.st_uid != unmapped_root))) return -1;
         if ((status.st_mode & 0022U) != 0U
                 && !(status.st_uid == 0U && (status.st_mode & S_ISVTX) != 0U)) {
             return -1;

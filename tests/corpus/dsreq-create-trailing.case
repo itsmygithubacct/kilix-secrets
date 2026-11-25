@@ -1,0 +1,3 @@
+# create label followed by a trailing byte
+kind=dsreq-create
+hex=00016100
