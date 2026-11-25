@@ -2,9 +2,19 @@ CC ?= cc
 AR ?= ar
 PKG_CONFIG ?= pkg-config
 PREFIX ?= /usr/local
+# Library directory, separate from the prefix so a package can use the
+# multiarch path. The default keeps a /usr/local install laid out as before.
+LIBDIR ?= $(PREFIX)/lib
+BINDIR ?= $(PREFIX)/bin
+INCLUDEDIR ?= $(PREFIX)/include
+UNITDIR ?= $(PREFIX)/lib/systemd/user
+DOCDIR ?= $(PREFIX)/share/doc/kilix-secrets
 DESTDIR ?=
 BUILD ?= build
 TEST_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),/tmp)
+# A distribution build can pass WERROR= so a new compiler warning does not
+# fail the package. The default is still to treat warnings as errors.
+WERROR ?= -Werror
 
 # Debian python3 -I searches /usr/lib/python3/dist-packages (a /usr package)
 # and /usr/local/lib/pythonX.Y/dist-packages. It does not search
@@ -25,7 +35,7 @@ SYSTEMD_LDLIBS ?= $(shell $(PKG_CONFIG) --libs libsystemd 2>/dev/null || printf 
 CPPFLAGS += -Iinclude -Isrc $(SODIUM_CPPFLAGS)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -fPIC -Wall -Wextra -Wpedantic -Wconversion -Wshadow \
-	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2 -Werror
+	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2 $(WERROR)
 LDFLAGS ?=
 LDLIBS += $(SODIUM_LDLIBS)
 
@@ -168,6 +178,8 @@ test: all $(BUILD)/test-unit $(BUILD)/test-crash $(BUILD)/test-vectors \
 		--build-dir $(BUILD) --cases 4096
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_package.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_libdir_install.py --build-dir $(BUILD)
 
 sanitize:
 	$(MAKE) clean BUILD=build-sanitize
@@ -185,22 +197,25 @@ fuzz: all $(BUILD)/parser-harness
 		--build-dir $(BUILD) --cases 65536
 
 install: all
-	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib \
-		$(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig \
-		$(DESTDIR)$(PREFIX)/lib/systemd/user \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets \
+	# Regenerate at install time. `all` may have written this file for a
+	# different PREFIX, and the rule does not depend on that value.
+	sed 's|@PREFIX@|$(PREFIX)|g' kilix-secrets.pc.in > $(BUILD)/kilix-secrets.pc
+	install -d $(DESTDIR)$(INCLUDEDIR) $(DESTDIR)$(LIBDIR) \
+		$(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR)/pkgconfig \
+		$(DESTDIR)$(UNITDIR) \
+		$(DESTDIR)$(DOCDIR) \
 		$(DESTDIR)$(PYTHONDIR)/kilix_secrets
-	install -m 0644 include/kilix_secrets.h $(DESTDIR)$(PREFIX)/include/
-	install -m 0644 $(BUILD)/libkilix-secrets.a $(DESTDIR)$(PREFIX)/lib/
-	install -m 0755 $(BUILD)/libkilix-secrets.so.0 $(DESTDIR)$(PREFIX)/lib/
-	ln -sfn libkilix-secrets.so.0 $(DESTDIR)$(PREFIX)/lib/libkilix-secrets.so
-	install -m 0755 $(BUILD)/kilix-secretsd $(BUILD)/kilix-secrets $(DESTDIR)$(PREFIX)/bin/
-	install -m 0644 $(BUILD)/kilix-secrets.pc $(DESTDIR)$(PREFIX)/lib/pkgconfig/
+	install -m 0644 include/kilix_secrets.h $(DESTDIR)$(INCLUDEDIR)/
+	install -m 0644 $(BUILD)/libkilix-secrets.a $(DESTDIR)$(LIBDIR)/
+	install -m 0755 $(BUILD)/libkilix-secrets.so.0 $(DESTDIR)$(LIBDIR)/
+	ln -sfn libkilix-secrets.so.0 $(DESTDIR)$(LIBDIR)/libkilix-secrets.so
+	install -m 0755 $(BUILD)/kilix-secretsd $(BUILD)/kilix-secrets $(DESTDIR)$(BINDIR)/
+	install -m 0644 $(BUILD)/kilix-secrets.pc $(DESTDIR)$(LIBDIR)/pkgconfig/
 	install -m 0644 service/kilix-secrets.socket service/kilix-secrets.service \
-		$(DESTDIR)$(PREFIX)/lib/systemd/user/
+		$(DESTDIR)$(UNITDIR)/
 	install -m 0644 LICENSE THIRD_PARTY_NOTICES.md docs/DEPENDENCIES.md \
 		docs/F113-CUSTODY-INTERFACE.md \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/
+		$(DESTDIR)$(DOCDIR)/
 	install -m 0644 python/kilix_secrets/__init__.py \
 		python/kilix_secrets/_binding.py \
 		python/kilix_secrets/_files.py \
@@ -210,19 +225,19 @@ install: all
 		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/include/kilix_secrets.h \
-		$(DESTDIR)$(PREFIX)/lib/libkilix-secrets.a \
-		$(DESTDIR)$(PREFIX)/lib/libkilix-secrets.so \
-		$(DESTDIR)$(PREFIX)/lib/libkilix-secrets.so.0 \
-		$(DESTDIR)$(PREFIX)/lib/pkgconfig/kilix-secrets.pc \
-		$(DESTDIR)$(PREFIX)/bin/kilix-secretsd \
-		$(DESTDIR)$(PREFIX)/bin/kilix-secrets \
-		$(DESTDIR)$(PREFIX)/lib/systemd/user/kilix-secrets.socket \
-		$(DESTDIR)$(PREFIX)/lib/systemd/user/kilix-secrets.service \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/LICENSE \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/THIRD_PARTY_NOTICES.md \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/DEPENDENCIES.md \
-		$(DESTDIR)$(PREFIX)/share/doc/kilix-secrets/F113-CUSTODY-INTERFACE.md \
+	rm -f $(DESTDIR)$(INCLUDEDIR)/kilix_secrets.h \
+		$(DESTDIR)$(LIBDIR)/libkilix-secrets.a \
+		$(DESTDIR)$(LIBDIR)/libkilix-secrets.so \
+		$(DESTDIR)$(LIBDIR)/libkilix-secrets.so.0 \
+		$(DESTDIR)$(LIBDIR)/pkgconfig/kilix-secrets.pc \
+		$(DESTDIR)$(BINDIR)/kilix-secretsd \
+		$(DESTDIR)$(BINDIR)/kilix-secrets \
+		$(DESTDIR)$(UNITDIR)/kilix-secrets.socket \
+		$(DESTDIR)$(UNITDIR)/kilix-secrets.service \
+		$(DESTDIR)$(DOCDIR)/LICENSE \
+		$(DESTDIR)$(DOCDIR)/THIRD_PARTY_NOTICES.md \
+		$(DESTDIR)$(DOCDIR)/DEPENDENCIES.md \
+		$(DESTDIR)$(DOCDIR)/F113-CUSTODY-INTERFACE.md \
 		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/__init__.py \
 		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_binding.py \
 		$(DESTDIR)$(PYTHONDIR)/kilix_secrets/_files.py \
@@ -233,19 +248,22 @@ uninstall:
 	-rmdir $(DESTDIR)$(PYTHONDIR)/kilix_secrets
 	-rmdir $(DESTDIR)$(PYTHONDIR)
 	-rmdir $(dir $(DESTDIR)$(PYTHONDIR))
-	-rmdir $(DESTDIR)$(PREFIX)/share/doc/kilix-secrets
+	-rmdir $(DESTDIR)$(DOCDIR)
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc
 	-rmdir $(DESTDIR)$(PREFIX)/share
-	-rmdir $(DESTDIR)$(PREFIX)/lib/systemd/user
+	-rmdir $(DESTDIR)$(LIBDIR)/pkgconfig
+	-rmdir $(DESTDIR)$(UNITDIR)
 	-rmdir $(DESTDIR)$(PREFIX)/lib/systemd
-	-rmdir $(DESTDIR)$(PREFIX)/lib/pkgconfig
-	-rmdir $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/bin \
-		$(DESTDIR)$(PREFIX)/lib
+	-rmdir $(DESTDIR)$(LIBDIR)
+	-rmdir $(DESTDIR)$(INCLUDEDIR) $(DESTDIR)$(BINDIR)
+	-rmdir $(DESTDIR)$(PREFIX)/lib
 	-rmdir $(DESTDIR)$(PREFIX)
 
 package-test: all
 	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
 		python3 tests/test_package.py --build-dir $(BUILD)
+	TMPDIR="$(TEST_TMPDIR)" PYTHONDONTWRITEBYTECODE=1 \
+		python3 tests/test_libdir_install.py --build-dir $(BUILD)
 
 deb:
 	TMPDIR="$(TEST_TMPDIR)" packaging/build-deb.sh
